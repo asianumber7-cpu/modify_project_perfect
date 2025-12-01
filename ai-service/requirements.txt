@@ -1,0 +1,39 @@
+# Core & API
+pydantic==2.7.4
+pydantic-settings==2.2.1
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+python-dotenv==1.0.1
+requests==2.31.0
+httpx==0.27.0
+python-multipart==0.0.9
+
+# Task Queue
+celery==5.3.6
+redis==5.0.3
+
+# AI & Data Processing
+torch==2.1.2
+transformers==4.41.2
+sentence-transformers==3.0.1
+accelerate==0.30.1
+numpy==1.26.4
+# 🚨 FIX: ibm-watsonx-ai 호환성을 위해 Pandas 다운그레이드 (2.2.1 -> 2.1.4)
+pandas==2.1.4
+Pillow==10.2.0
+
+# LangChain Ecosystem (v0.2 Standard)
+langchain==0.2.8
+langchain-community==0.2.7
+langchain-core==0.2.21
+langchain-openai==0.1.16
+langchain-huggingface==0.0.3
+langchain-text-splitters==0.2.2
+
+# 🚨 FIX: Watsonx 공식 지원 패키지
+langchain-ibm==0.1.7
+ibm-watsonx-ai==1.0.4
+
+# Cloud & Storage
+boto3==1.34.60
+google-api-python-client==2.122.0

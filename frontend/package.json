@@ -1,0 +1,37 @@
+{
+  "name": "modify-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "@tanstack/react-query": "5.56.2",
+    "zustand": "4.5.5",
+    "axios": "1.7.7",
+    "react-router-dom": "6.26.2",
+    "crypto-js": "4.2.0",
+    "tailwindcss": "3.4.11",
+    "lucide-react": "0.445.0",
+    "chart.js": "4.4.4",
+    "react-chartjs-2": "5.2.0",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^2.3.0"
+  },
+  "devDependencies": {
+    "vite": "5.4.6",
+    "@vitejs/plugin-react": "4.3.1",
+    "typescript": "5.6.2",
+    "@types/react": "18.3.3",
+    "@types/react-dom": "18.3.0",
+    "@types/crypto-js": "^4.2.2",
+    "@types/node": "^20.12.7",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.38"
+  }
+}

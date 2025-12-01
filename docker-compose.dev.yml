@@ -1,0 +1,172 @@
+version: '3.9'
+
+services:
+  # 1. Database (PostgreSQL with pgvector)
+  postgres:
+    image: pgvector/pgvector:0.6.0-pg16
+    container_name: modify-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: modify_user
+      POSTGRES_PASSWORD: modify_password
+      POSTGRES_DB: modify_db
+      TZ: Asia/Seoul
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U modify_user -d modify_db"] 
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - modify-network
+
+  # 2. Cache & Broker (Redis)
+  redis:
+    image: redis:7.2-alpine
+    container_name: modify-redis
+    restart: always
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --appendonly yes
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - modify-network
+
+  # 3. Backend API (FastAPI)
+  backend-core:
+    build:
+      context: ./backend-core
+      dockerfile: Dockerfile
+    container_name: modify-backend
+    restart: always
+    # 호스트 8000 포트와 연결
+    ports:
+      - "8000:8000"
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file:
+      - .env.dev
+    volumes:
+      - ./backend-core:/app 
+      - ./.env.dev:/app/.env.dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - modify-network
+
+  # 4. Backend Worker (Celery for Email, etc.)
+  celery-worker:
+    build:
+      context: ./backend-core
+      dockerfile: Dockerfile
+    container_name: modify-celery-worker
+    restart: always
+    command: celery -A src.core.celery_app worker --loglevel=info
+    env_file:
+      - .env.dev
+    volumes:
+      - ./backend-core:/app
+      - ./.env.dev:/app/.env.dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - modify-network    
+      
+  # 5. AI Service API (HTTP 요청 처리용)
+  ai-service-api: 
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    container_name: modify-ai-api
+    restart: always
+    # AI 서비스 API 서버 실행
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8005:8000" # 호스트 8005 -> 컨테이너 8000 (테스트용)
+    env_file:
+      - .env.dev
+    volumes:
+      - ./ai-service:/app 
+      - model_cache:/app/models_cache
+      - ./.env.dev:/app/.env.dev
+    networks:
+      - modify-network
+
+  # 6. AI Worker (Celery for Heavy Tasks)
+  ai-service-worker: 
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    container_name: modify-ai-worker
+    restart: always
+    # AI 전용 Celery 워커 실행
+    command: celery -A src.worker.celery_app worker --loglevel=info --concurrency=2
+    env_file:
+      - .env.dev
+    volumes:
+      - ./ai-service:/app 
+      - model_cache:/app/models_cache
+      - ./.env.dev:/app/.env.dev
+    depends_on:
+      redis:
+        condition: service_healthy
+      ai-service-api:
+        condition: service_started
+    networks:
+      - modify-network
+
+  # 7. Frontend (Vite Dev Server)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      # target: builder 
+    container_name: modify-frontend
+    env_file:
+      - .env.dev
+    volumes:
+      - ./frontend:/app 
+      - /app/node_modules
+    command: npm run dev -- --host 0.0.0.0 
+    # 포트 매핑 필요하다면 추가 (Vite 기본 5173)
+    ports:
+      - "5173:5173"
+    networks:
+      - modify-network
+    depends_on:
+      - backend-core
+      
+  # 8. Nginx Reverse Proxy
+  nginx-proxy:
+    image: nginx:stable-alpine
+    container_name: modify-nginx-proxy
+    volumes:
+      - ./Deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - frontend
+      - backend-core
+    networks:
+      - modify-network
+
+volumes:
+  postgres_data:
+  model_cache:
+
+networks:
+  modify-network:
+    driver: bridge
