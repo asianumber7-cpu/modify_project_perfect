@@ -29,7 +29,6 @@ router = APIRouter()
 # ------------------------------------------------------------------
 def sanitize_string(value: Any) -> Any:
     if isinstance(value, str):
-        # PostgreSQL NULL byte 및 공백 제거
         return value.replace("\x00", "").strip()
     return value
 
@@ -38,6 +37,7 @@ def sanitize_string(value: Any) -> Any:
 # ------------------------------------------------------------------
 async def _heal_product_embedding(db: AsyncSession, product: Any) -> Any:
     """상품 데이터(임베딩, 설명) 누락 시 AI 서비스로 복구"""
+    # settings.AI_SERVICE_API_URL은 이미 "http://.../api/v1"을 포함함
     AI_SERVICE_API_URL = settings.AI_SERVICE_API_URL
     
     is_broken = (
@@ -58,6 +58,7 @@ async def _heal_product_embedding(db: AsyncSession, product: Any) -> Any:
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 prompt = f"상품명: {product.name}, 카테고리: {product.category}. 매력적인 쇼핑몰 상세 설명을 5문장 작성해줘."
+                # [FIX] 중복 경로 제거 (/api/v1 삭제)
                 res = await client.post(f"{AI_SERVICE_API_URL}/llm-generate-response", json={"prompt": prompt})
                 if res.status_code == 200:
                     new_description = res.json().get("answer", product.name)
@@ -69,6 +70,7 @@ async def _heal_product_embedding(db: AsyncSession, product: Any) -> Any:
     try:
         text_to_embed = f"{product.name} {product.category} {new_description}"
         async with httpx.AsyncClient(timeout=10.0) as client:
+            # [FIX] 중복 경로 제거
             res = await client.post(f"{AI_SERVICE_API_URL}/embed-text", json={"text": text_to_embed})
             if res.status_code == 200:
                 new_vector = res.json().get("vector", [])
@@ -88,7 +90,7 @@ async def _heal_product_embedding(db: AsyncSession, product: Any) -> Any:
 
 
 # =========================================================
-# 1️⃣ [API] 이미지 자동 분석 업로드 (단일 -> 프론트에서 반복 호출)
+# 1️⃣ [API] 이미지 자동 분석 업로드 (단일)
 # =========================================================
 @router.post("/upload/image-auto", response_model=ProductResponse)
 async def upload_product_image_auto(
@@ -111,6 +113,8 @@ async def upload_product_image_auto(
             file_content = await file.read()
             files = {"file": (file.filename, file_content, file.content_type)}
             
+            # [FIX] 중복 경로 제거 (/api/v1 삭제)
+            # 최종 URL: http://ai-service-api:8000/api/v1/analyze-image
             response = await client.post(
                 f"{AI_SERVICE_API_URL}/analyze-image",
                 files=files
@@ -141,25 +145,28 @@ async def upload_product_image_auto(
         logger.error(f"File Save Error: {e}")
         raise HTTPException(status_code=500, detail="서버 파일 저장 실패")
 
-    # 🚨 [FIX] 데이터 검증 및 안전장치 강화
-    # 1. 이름이 없거나 빈 문자열이면 파일명 사용
+    # [Step C] 데이터 파싱
     raw_name = ai_analyzed_data.get("name")
     if not raw_name or len(str(raw_name).strip()) < 2:
         final_name = f"상품 {file.filename}"
     else:
         final_name = str(raw_name).strip()
 
-    # 2. 설명이 없으면 기본 메시지
     raw_desc = ai_analyzed_data.get("description")
     final_desc = str(raw_desc).strip() if raw_desc else "AI 분석 중... 상세 내용을 수정해주세요."
 
-    # 3. 가격이 0원 이하이거나 없으면 0원 처리
+    final_gender = ai_analyzed_data.get("gender", "Unisex")
+
     try:
         final_price = int(ai_analyzed_data.get("price", 0))
     except:
         final_price = 0
 
-    # [Step C] DB 저장
+    vector = ai_analyzed_data.get("vector", [])
+    if not vector:
+        logger.warning("⚠️ Empty vector received from AI. Product will be saved but not searchable.")
+
+    # [Step D] DB 저장
     product_in_data = {
         "name": sanitize_string(final_name),
         "category": sanitize_string(ai_analyzed_data.get("category", "Uncategorized")),
@@ -167,13 +174,13 @@ async def upload_product_image_auto(
         "price": final_price,
         "stock_quantity": 100,
         "image_url": final_image_url,
-        "embedding": ai_analyzed_data.get("vector", []),
+        "embedding": vector,
+        "gender": final_gender,
         "is_active": True
     }
 
     try:
         new_product = await crud_product.create(db, obj_in=product_in_data)
-        # 생성 후 힐링 (벡터 누락 시)
         new_product = await _heal_product_embedding(db, new_product)
         return new_product
     except Exception as e:
@@ -193,7 +200,6 @@ async def upload_products_csv(
     if not current_user.is_superuser:
         raise HTTPException(status_code=403, detail="관리자 권한이 필요합니다.")
 
-    # 1. 인코딩 자동 감지
     content = await file.read()
     try:
         decoded_content = content.decode("utf-8")
@@ -214,6 +220,7 @@ async def upload_products_csv(
 
             category = row.get("category") or row.get("카테고리") or "Uncategorized"
             description = row.get("description") or row.get("설명") or ""
+            gender = row.get("gender") or row.get("성별") or "Unisex"
             
             price_raw = row.get("price") or row.get("가격") or "0"
             try:
@@ -229,13 +236,12 @@ async def upload_products_csv(
             
             image_url = row.get("image_url") or row.get("이미지") or "https://placehold.co/400x500?text=No+Image"
 
-            # 임베딩 생성 시도 (실패해도 진행 -> 나중에 Self-Healing)
             vector = []
-            text_for_vector = f"{name} {category} {description}"
+            text_for_vector = f"[{gender}] {name} {category} {description}"
             
-            # (속도를 위해 타임아웃 짧게 설정)
             async with httpx.AsyncClient(timeout=3.0) as client:
                 try:
+                    # [FIX] 중복 경로 제거
                     res = await client.post(
                         f"{AI_SERVICE_API_URL}/embed-text", 
                         json={"text": text_for_vector}
@@ -253,6 +259,7 @@ async def upload_products_csv(
                 "stock_quantity": stock,
                 "image_url": image_url,
                 "embedding": vector,
+                "gender": gender,
                 "is_active": True
             }
             
@@ -292,6 +299,7 @@ async def create_product(
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
+            # [FIX] 중복 경로 제거
             response = await client.post(
                 f"{AI_SERVICE_API_URL}/embed-text",
                 json={"text": text_to_embed}
@@ -316,7 +324,6 @@ async def read_product(
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
     
-    # [FIX] 조회 시 데이터가 깨져있으면 복구 (Self-Healing)
     product = await _heal_product_embedding(db, product)
     return product
 
@@ -331,12 +338,11 @@ async def llm_query_product(
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    # 여기서도 필요시 복구
     product = await _heal_product_embedding(db, product)
 
     context = (
         f"상품명: {product.name}, 카테고리: {product.category}, 가격: {product.price}원, "
-        f"설명: {product.description}"
+        f"설명: {product.description}, 성별: {product.gender}"
     )
     prompt = (
         f"사용자 질문: {query_body.question}\n"
@@ -346,6 +352,7 @@ async def llm_query_product(
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
+            # [FIX] 중복 경로 제거
             ai_response = await client.post(
                 f"{AI_SERVICE_API_URL}/llm-generate-response", 
                 json={"prompt": prompt}
@@ -357,7 +364,7 @@ async def llm_query_product(
             logger.error(f"LLM Query failed: {e}")
             raise HTTPException(status_code=503, detail="AI 서비스 통신 오류")
 
-# --- AI Coordination (Self-Healing Included) ---
+# --- AI Coordination ---
 @router.get("/ai-coordination/{product_id}", response_model=CoordinationResponse)
 async def get_ai_coordination_products(
     product_id: int,
@@ -369,15 +376,13 @@ async def get_ai_coordination_products(
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    # 🚑 [CRITICAL FIX] 데이터가 없으면 즉시 복구
     product = await _heal_product_embedding(db, product)
     
     if not product.embedding:
         raise HTTPException(status_code=503, detail="AI Service is currently unavailable to analyze this product.")
     
-    # 코디 키워드 추출
     coordination_prompt = (
-        f"상품명 '{product.name}', 카테고리 '{product.category}'의 코디에 적합한 "
+        f"상품명 '{product.name}', 성별 '{product.gender}', 카테고리 '{product.category}'의 코디에 적합한 "
         f"다른 카테고리(예: 상의면 하의)의 검색 키워드 3개를 한국어로 쉼표로 구분해줘."
     )
     AI_SERVICE_API_URL = settings.AI_SERVICE_API_URL
@@ -385,6 +390,7 @@ async def get_ai_coordination_products(
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
+            # [FIX] 중복 경로 제거
             llm_res = await client.post(
                 f"{AI_SERVICE_API_URL}/llm-generate-response", 
                 json={"prompt": coordination_prompt}
@@ -398,12 +404,12 @@ async def get_ai_coordination_products(
         except Exception as e:
             logger.error(f"LLM Keyword Generation failed: {e}")
 
-    # 임베딩 생성
     embedding_text = f"{product.name} 코디 {' '.join(coordination_keywords)}"
-    coordination_vector = product.embedding # fallback
+    coordination_vector = product.embedding
     
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
+            # [FIX] 중복 경로 제거
             vector_res = await client.post(
                 f"{AI_SERVICE_API_URL}/embed-text", 
                 json={"text": embedding_text}
@@ -413,7 +419,6 @@ async def get_ai_coordination_products(
         except Exception as e:
             logger.error(f"Embedding API failed: {e}")
 
-    # 벡터 검색
     coordination_products = await crud_product.search_by_vector(
         db, 
         query_vector=coordination_vector, 
@@ -431,7 +436,7 @@ async def get_ai_coordination_products(
         products=[ProductResponse.model_validate(p) for p in coordination_products]
     )
 
-# --- Related Recommendations (Restored) ---
+# --- Related Recommendations ---
 
 @router.get("/related-price/{product_id}", response_model=CoordinationResponse)
 async def get_related_by_price(
@@ -440,7 +445,7 @@ async def get_related_by_price(
     current_user: User = Depends(deps.get_current_user),
 ) -> CoordinationResponse:
     product = await crud_product.get(db, product_id=product_id)
-    product = await _heal_product_embedding(db, product) # Heal applied
+    product = await _heal_product_embedding(db, product) 
     
     if not product or not product.embedding:
         raise HTTPException(status_code=404, detail="AI Analysis Required")
@@ -475,7 +480,7 @@ async def get_related_by_color(
     current_user: User = Depends(deps.get_current_user),
 ) -> CoordinationResponse:
     product = await crud_product.get(db, product_id=product_id)
-    product = await _heal_product_embedding(db, product) # Heal applied
+    product = await _heal_product_embedding(db, product)
     
     if not product or not product.embedding:
         raise HTTPException(status_code=404, detail="AI Analysis Required")
@@ -486,6 +491,7 @@ async def get_related_by_color(
     
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
+            # [FIX] 중복 경로 제거
             llm_res = await client.post(
                 f"{AI_SERVICE_API_URL}/llm-generate-response", 
                 json={"prompt": color_prompt}
@@ -496,10 +502,11 @@ async def get_related_by_color(
             pass
 
     embedding_text = f"{product.name} 디자인 {target_color} 색상"
-    color_vector = product.embedding # fallback
+    color_vector = product.embedding 
     
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
+            # [FIX] 중복 경로 제거
             vector_res = await client.post(
                 f"{AI_SERVICE_API_URL}/embed-text", 
                 json={"text": embedding_text}
@@ -528,7 +535,7 @@ async def get_related_by_brand(
     current_user: User = Depends(deps.get_current_user),
 ) -> CoordinationResponse:
     product = await crud_product.get(db, product_id=product_id)
-    product = await _heal_product_embedding(db, product) # Heal applied
+    product = await _heal_product_embedding(db, product)
     
     if not product or not product.embedding:
         raise HTTPException(status_code=404, detail="AI Analysis Required")
@@ -539,6 +546,7 @@ async def get_related_by_brand(
     
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
+            # [FIX] 중복 경로 제거
             llm_res = await client.post(
                 f"{AI_SERVICE_API_URL}/llm-generate-response", 
                 json={"prompt": style_prompt}
@@ -550,10 +558,11 @@ async def get_related_by_brand(
             pass
 
     embedding_text = f"다른 브랜드 {product.category} {', '.join(style_keywords)}"
-    brand_vector = product.embedding # fallback
+    brand_vector = product.embedding 
     
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
+            # [FIX] 중복 경로 제거
             vector_res = await client.post(
                 f"{AI_SERVICE_API_URL}/embed-text", 
                 json={"text": embedding_text}

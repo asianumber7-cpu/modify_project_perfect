@@ -1,20 +1,15 @@
 import os
 import logging
 import json
-import random
-from typing import List, Optional, Any
+from typing import List, Optional
 
-# LangChain 라이브러리
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ibm import ChatWatsonx
 from langchain_core.messages import HumanMessage
 
-# 로깅 설정
 logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-
-# Vision 지원 모델
 VISION_MODEL_ID = "meta-llama/llama-3-2-11b-vision-instruct" 
 
 class ModelEngine:
@@ -28,7 +23,6 @@ class ModelEngine:
         self.is_initialized = False
 
     def initialize(self):
-        """모델 엔진 초기화"""
         logger.info(f"🚀 Initializing Model Engine (Multilingual)...")
         
         try:
@@ -36,17 +30,21 @@ class ModelEngine:
             url = os.getenv("WATSONX_URL", "https://us-south.ml.cloud.ibm.com")
             
             if api_key and self.project_id:
-                # 1. Vision/Chat 모델 초기화
+                # [수정됨] Vision/Chat 모델 파라미터 최적화
                 self.vision_model = ChatWatsonx(
                     model_id=VISION_MODEL_ID,
                     url=url,
                     apikey=api_key,
                     project_id=self.project_id,
                     params={
-                        "decoding_method": "greedy",
+                        # [핵심] greedy -> sample 변경 (한국어 깨짐 방지)
+                        "decoding_method": "sample", 
                         "max_new_tokens": 900,
-                        "min_new_tokens": 1,
-                        "temperature": 0.1
+                        "min_new_tokens": 10,
+                        "temperature": 0.7,       
+                        "top_p": 0.9,             
+                        "top_k": 50,
+                        "stop_sequences": ["}"]   
                     }
                 )
                 self.text_model = self.vision_model
@@ -57,7 +55,6 @@ class ModelEngine:
         except Exception as e:
             logger.error(f"❌ Watsonx Init Failed: {e}")
 
-        # 2. 임베딩 모델 초기화
         try:
             logger.info(f"📥 Loading Embedding Model: {EMBEDDING_MODEL_NAME}...")
             self.embedding_model = HuggingFaceEmbeddings(
@@ -71,7 +68,6 @@ class ModelEngine:
             logger.error(f"❌ Embedding Model Failed: {e}")
 
     def generate_embedding(self, text: str) -> List[float]:
-        """텍스트 -> 벡터 변환"""
         if not self.embedding_model:
             self.initialize()
         if self.embedding_model:
@@ -79,10 +75,8 @@ class ModelEngine:
         return [0.0] * 768
 
     def generate_text(self, prompt: str) -> str:
-        """일반 텍스트 생성"""
         if not self.text_model:
             self.initialize()
-        
         if self.text_model:
             try:
                 response = self.text_model.invoke(prompt)
@@ -92,12 +86,8 @@ class ModelEngine:
         return "AI Service Unavailable"
 
     def generate_with_image(self, text_prompt: str, image_b64: str) -> str:
-        """
-        [Vision] 이미지와 텍스트를 함께 처리
-        """
         if not self.vision_model:
             self.initialize()
-            
         if not self.vision_model:
             raise RuntimeError("AI Model not initialized")
 
@@ -112,7 +102,12 @@ class ModelEngine:
                 ]
             )
             response = self.vision_model.invoke([message])
-            return response.content
+            
+            content = response.content
+            # JSON 닫는 괄호 안전장치
+            if "{" in content and "}" not in content:
+                content += "}"
+            return content
             
         except Exception as e:
             logger.error(f"👁️ Vision Analysis Error: {e}")

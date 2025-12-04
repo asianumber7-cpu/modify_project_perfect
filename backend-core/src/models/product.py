@@ -1,11 +1,11 @@
 # backend-core/src/models/product.py
+
 from datetime import datetime
 from typing import Optional, List
 from sqlalchemy import String, Integer, Boolean, TIMESTAMP, Text, CheckConstraint, Index, text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 from pgvector.sqlalchemy import Vector
-# [수정됨] 반드시 src.db.session의 Base를 사용해야 Alembic이 인식함
 from src.db.session import Base 
 from src.config.settings import settings
 
@@ -20,6 +20,10 @@ class Product(Base):
     category: Mapped[Optional[str]] = mapped_column(String(100), index=True)
     image_url: Mapped[Optional[str]] = mapped_column(String(500))
     
+    # [NEW] 성별 필터링을 위한 컬럼 추가 (Male, Female, Unisex)
+    # index=True를 설정하여 필터링 속도 최적화
+    gender: Mapped[Optional[str]] = mapped_column(String(20), index=True, nullable=True)
+
     # 768차원 벡터
     embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(768))
 
@@ -37,6 +41,8 @@ class Product(Base):
     __table_args__ = (
         CheckConstraint('price >= 0', name='check_price_positive'),
         CheckConstraint('stock_quantity >= 0', name='check_stock_positive'),
+        # Gender 값 제약 조건 (선택 사항, 데이터 무결성 강화)
+        CheckConstraint("gender IN ('Male', 'Female', 'Unisex', NULL)", name='check_gender_valid'),
         Index(
             'ix_product_embedding_hnsw',
             'embedding',
