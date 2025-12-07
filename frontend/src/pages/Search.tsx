@@ -80,6 +80,7 @@ export default function Search() {
     
     // UI 상태
     const [isAnalyzingImage, setIsAnalyzingImage] = useState(false);
+    const [isSearchingProducts, setIsSearchingProducts] = useState(false);  // ✅ NEW
     const [showProducts, setShowProducts] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
     const [loadingStepIndex, setLoadingStepIndex] = useState(0); 
@@ -155,7 +156,7 @@ export default function Search() {
         }
     }, [speak, addRecentSearch]);
 
-    // [복원] 음성 검색 로직 (누락되었던 부분)
+    // 음성 검색 로직
     const handleVoiceSearch = () => {
         if (!('webkitSpeechRecognition' in window)) {
             alert('Chrome 브라우저를 사용해주세요.');
@@ -178,6 +179,39 @@ export default function Search() {
         handleSearch(query, imageFile, false);
     };
 
+    // ✅ [수정] 후보 이미지 선택 시 상품 재검색
+    const handleSelectCandidateImage = async (imageBase64: string) => {
+        setSelectedImage(imageBase64);
+        
+        // 상품이 이미 표시된 상태라면 해당 이미지로 재검색
+        if (showProducts) {
+            await searchProductsByImage(imageBase64);
+        }
+    };
+
+    // ✅ [NEW] 이미지 기반 상품 검색
+    const searchProductsByImage = async (imageBase64: string) => {
+        setIsSearchingProducts(true);
+        
+        try {
+            // 1. AI 서비스에서 CLIP 벡터 생성
+            const clipResponse = await client.post('/search/search-by-clip', {
+                image_b64: imageBase64,
+                limit: 12
+            });
+            
+            if (clipResponse.data && clipResponse.data.products) {
+                setResults(clipResponse.data.products);
+                setTimestamp(Date.now());
+            }
+        } catch (error) {
+            console.error("Image-based search failed:", error);
+            // 실패 시 기존 결과 유지
+        } finally {
+            setIsSearchingProducts(false);
+        }
+    };
+
     const handleAnalyzeSelectedImage = async () => {
         if (!selectedImage || !query) return;
         setIsAnalyzingImage(true);
@@ -195,9 +229,15 @@ export default function Search() {
         }
     };
 
-    // [복원] 상품 보기 핸들러 (버튼 클릭 시 스크롤 이동)
-    const handleShowProducts = () => {
+    // ✅ [수정] 상품 보기 핸들러 - 선택된 이미지로 검색
+    const handleShowProducts = async () => {
         setShowProducts(true);
+        
+        // 선택된 이미지가 있으면 해당 이미지로 상품 검색
+        if (selectedImage) {
+            await searchProductsByImage(selectedImage);
+        }
+        
         setTimeout(() => {
             productSectionRef.current?.scrollIntoView({ behavior: 'smooth' });
         }, 100);
@@ -273,7 +313,7 @@ export default function Search() {
 
             {/* [1단계] Visual RAG 리포트 */}
             {!isLoading && aiAnalysis && (
-                <div className="mb-12 bg-white rounded-2xl p-6 border border-gray-100 shadow-sm animate-in zoom-in-95 duration-500">
+                <div className="mb-12 bg-white rounded-2xl p-6 border border-gray-100 shadow-sm animate-in zoom-in-95 duration-500 overflow-hidden">
                     <div className="flex flex-col md:flex-row gap-8 items-start">
                         {/* 이미지 & 후보군 */}
                         <div className="w-full md:w-1/3 flex-shrink-0 flex flex-col gap-4">
@@ -292,13 +332,13 @@ export default function Search() {
                             {aiAnalysis.candidates && aiAnalysis.candidates.length > 0 && (
                                 <div className="animate-in slide-in-from-bottom-2 fade-in">
                                     <p className="text-xs text-gray-500 mb-2 font-medium ml-1 flex items-center gap-1">
-                                        <ImageIcon className="w-3 h-3"/> 다른 스타일 보기
+                                        <ImageIcon className="w-3 h-3"/> 다른 스타일 보기 (클릭하면 상품 재검색)
                                     </p>
                                     <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-hide snap-x">
                                         {aiAnalysis.candidates.map((cand, idx) => (
                                             <button 
                                                 key={idx}
-                                                onClick={() => setSelectedImage(cand.image_base64)}
+                                                onClick={() => handleSelectCandidateImage(cand.image_base64)}
                                                 className={`relative w-16 h-20 rounded-lg overflow-hidden flex-shrink-0 border-2 transition-all snap-start ${
                                                     selectedImage === cand.image_base64 
                                                     ? 'border-purple-600 ring-2 ring-purple-100 scale-105' 
@@ -321,10 +361,11 @@ export default function Search() {
                             )}
                         </div>
 
-                        {/* 텍스트 & 액션 버튼 */}
-                        <div className="flex-1 py-2 space-y-6">
-                            <div className="bg-purple-50/50 rounded-2xl p-8 border border-purple-100 relative shadow-sm min-h-[300px]">
-                                <div className="flex items-center justify-between mb-4">
+                        {/* 텍스트 & 액션 버튼 - overflow 처리 */}
+                        <div className="flex-1 py-2 space-y-6 min-w-0">
+                            {/* 분석 리포트 박스 */}
+                            <div className="bg-purple-50/50 rounded-2xl p-6 md:p-8 border border-purple-100 relative shadow-sm min-h-[300px] overflow-hidden">
+                                <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
                                     <div className="flex items-center gap-2">
                                         <Sparkles className="w-5 h-5 text-purple-600" />
                                         <h2 className="text-lg font-bold text-gray-800">스타일 분석 리포트</h2>
@@ -349,17 +390,18 @@ export default function Search() {
                                         <p className="text-sm text-purple-700 font-medium">AI가 새로운 스타일을 분석하고 있습니다...</p>
                                     </div>
                                 ) : (
-                                    <div className="prose prose-purple max-w-none animate-in fade-in duration-300">
-                                        <p className="text-gray-800 leading-relaxed text-base whitespace-pre-wrap font-medium">
+                                    /* 긴 텍스트/URL 줄바꿈 처리 */
+                                    <div className="prose prose-purple max-w-none animate-in fade-in duration-300 overflow-hidden">
+                                        <p className="text-gray-800 leading-relaxed text-base whitespace-pre-wrap break-words overflow-wrap-anywhere font-medium">
                                             {currentText}
                                         </p>
                                     </div>
                                 )}
                             </div>
 
-                            {/* [복원] 액션 버튼 영역: 챗봇 스타일 가이드 */}
+                            {/* 액션 버튼 영역 */}
                             <div className="space-y-4 animate-in slide-in-from-bottom-4 fade-in">
-                                <div className="bg-white border border-gray-200 rounded-tr-2xl rounded-br-2xl rounded-bl-2xl p-4 shadow-sm inline-block relative">
+                                <div className="bg-white border border-gray-200 rounded-tr-2xl rounded-br-2xl rounded-bl-2xl p-4 shadow-sm inline-block relative max-w-full">
                                     <p className="text-gray-800 font-medium">
                                         분석된 스타일과 유사한 상품을 찾아드릴까요?
                                     </p>
@@ -369,11 +411,19 @@ export default function Search() {
                                 <div className="flex flex-wrap gap-3">
                                     <button 
                                         onClick={handleShowProducts}
-                                        className="px-6 py-3 bg-indigo-600 text-white rounded-full font-bold hover:bg-indigo-700 transition-all flex items-center gap-2 shadow-md hover:shadow-lg active:scale-95"
+                                        disabled={isSearchingProducts}
+                                        className="px-6 py-3 bg-indigo-600 text-white rounded-full font-bold hover:bg-indigo-700 transition-all flex items-center gap-2 shadow-md hover:shadow-lg active:scale-95 disabled:opacity-50"
                                     >
-                                        <Check className="w-5 h-5" /> 네, 전체 코디 보여줘
+                                        {isSearchingProducts ? (
+                                            <>
+                                                <RefreshCw className="w-5 h-5 animate-spin" /> 검색 중...
+                                            </>
+                                        ) : (
+                                            <>
+                                                <Check className="w-5 h-5" /> 네, 전체 코디 보여줘
+                                            </>
+                                        )}
                                     </button>
-                                    {/* [복원] 기존 UI에 있던 필터 버튼들 (기능은 추후 구현) */}
                                     <button className="px-5 py-3 bg-white border border-gray-200 text-gray-600 rounded-full font-medium hover:bg-gray-50 hover:border-gray-300 transition-all">
                                         상의만
                                     </button>
@@ -387,13 +437,16 @@ export default function Search() {
                 </div>
             )}
 
-            {/* [2단계] 상품 리스트 (스크롤 이동 대상) */}
+            {/* [2단계] 상품 리스트 */}
             {!isLoading && showProducts && results.length > 0 && (
                 <div ref={productSectionRef} className="animate-in slide-in-from-bottom-10 duration-700 fade-in space-y-8 pt-8 border-t border-gray-100">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
                             <ShoppingBag className="w-6 h-6 text-gray-700" />
                             <h2 className="text-2xl font-bold text-gray-900">추천 상품 ({results.length})</h2>
+                            {isSearchingProducts && (
+                                <RefreshCw className="w-5 h-5 text-purple-500 animate-spin ml-2" />
+                            )}
                         </div>
                         <button onClick={handleScrollTop} className="text-gray-500 hover:text-purple-600 flex items-center gap-1 text-sm font-medium transition-colors">
                             <ArrowUp className="w-4 h-4" /> 분석 다시 보기
@@ -428,6 +481,14 @@ export default function Search() {
                     </button>
                 </div>
             )}
+
+            {/* 커스텀 CSS for overflow-wrap */}
+            <style>{`
+                .overflow-wrap-anywhere {
+                    overflow-wrap: anywhere;
+                    word-break: break-word;
+                }
+            `}</style>
         </div>
     );
 }

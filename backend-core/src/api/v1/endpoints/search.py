@@ -5,7 +5,6 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 import httpx
-# [중요] BaseModel Import 추가 (오류 해결)
 from pydantic import BaseModel, ValidationError 
 
 from src.api import deps
@@ -16,10 +15,11 @@ from src.config.settings import settings
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# [NEW] 이미지 상세 분석 요청을 위한 데이터 모델 정의
+# DTO
 class ImageAnalysisRequest(BaseModel):
     image_b64: str
     query: str
+
 
 def detect_gender_intent(query: str) -> Optional[str]:
     """검색어에서 성별 키워드 추출"""
@@ -30,13 +30,52 @@ def detect_gender_intent(query: str) -> Optional[str]:
         return "Female"
     return None
 
-# [복원] 외부 이미지 프록시 다운로드 (CORS/403 방지)
+
+def extract_core_keyword(query: str) -> str:
+    """검색어에서 핵심 상품 키워드 추출 (성별/수식어 제거)"""
+    import re
+    
+    # 제거할 단어들
+    remove_words = [
+        "남자", "여자", "남성", "여성", "남성용", "여성용",
+        "추천", "해줘", "보여줘", "찾아줘", "알려줘",
+        "스타일", "패션", "옷", "의류", "용"
+    ]
+    
+    result = query
+    for word in remove_words:
+        result = result.replace(word, "")
+    
+    # 조사 제거
+    result = re.sub(r'(은|는|이|가|을|를|의|에|로)$', '', result.strip())
+    
+    return result.strip() if result.strip() else query
+
+
+def is_celebrity_search(query: str) -> bool:
+    """연예인/인물 검색인지 판단"""
+    import re
+    
+    # 패션 관련 키워드와 함께 사용된 경우
+    fashion_keywords = ["패션", "스타일", "코디", "룩", "공항", "착장", "의상", "옷"]
+    
+    # 한글 이름 패턴 (2-4글자)
+    korean_name = re.search(r'[가-힣]{2,4}', query)
+    
+    if korean_name and any(k in query for k in fashion_keywords):
+        return True
+    
+    return False
+
+
 async def fetch_image_as_base64(url: str) -> Optional[str]:
-    if not url: return None
+    """외부 이미지 프록시 다운로드"""
+    if not url:
+        return None
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://www.google.com/" 
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.google.com/"
         }
         async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
             response = await client.get(url, headers=headers)
@@ -48,18 +87,98 @@ async def fetch_image_as_base64(url: str) -> Optional[str]:
         logger.warning(f"⚠️ Failed to proxy image ({url}): {e}")
     return None
 
-# [NEW] 개별 이미지 분석 프록시 엔드포인트
+
+# ✅ NEW: CLIP 이미지 기반 검색 엔드포인트
+class ClipSearchRequest(BaseModel):
+    image_b64: str
+    limit: int = 12
+
+
+@router.post("/search-by-clip")
+async def search_by_clip_image(
+    request: ClipSearchRequest,
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """
+    이미지 기반 상품 검색
+    - 후보 이미지 클릭 시 호출
+    - 이미지 → CLIP 벡터 → 유사 상품 검색
+    """
+    logger.info(f"🖼️ CLIP Image Search Request (limit: {request.limit})")
+    
+    AI_SERVICE_API_URL = settings.AI_SERVICE_API_URL
+    
+    try:
+        # 1. AI 서비스에서 CLIP 벡터 생성
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            clip_res = await client.post(
+                f"{AI_SERVICE_API_URL}/generate-clip-vector",
+                json={"image_b64": request.image_b64}
+            )
+            
+            if clip_res.status_code != 200:
+                raise HTTPException(status_code=500, detail="CLIP 벡터 생성 실패")
+            
+            clip_data = clip_res.json()
+            clip_vector = clip_data.get("vector", [])
+            
+            if not clip_vector or len(clip_vector) != 512:
+                raise HTTPException(status_code=500, detail="유효하지 않은 CLIP 벡터")
+        
+        logger.info(f"✅ CLIP vector generated: {len(clip_vector)} dims")
+        
+        # 2. CLIP 벡터로 상품 검색
+        results = await crud_product.search_by_clip_vector(
+            db,
+            clip_vector=clip_vector,
+            limit=request.limit
+        )
+        
+        logger.info(f"✅ CLIP search found {len(results)} products")
+        
+        # 3. Response 구성
+        product_responses = []
+        for p in results:
+            try:
+                p_dict = {
+                    "id": p.id,
+                    "name": p.name or "Unnamed Product",
+                    "description": p.description or "",
+                    "price": float(p.price) if p.price else 0,
+                    "stock_quantity": int(p.stock_quantity) if p.stock_quantity else 0,
+                    "category": p.category or "Etc",
+                    "image_url": p.image_url or "",
+                    "gender": p.gender or "Unisex",
+                    "is_active": p.is_active if p.is_active is not None else True,
+                    "created_at": p.created_at,
+                    "updated_at": p.updated_at,
+                    "in_stock": (p.stock_quantity or 0) > 0
+                }
+                validated_product = ProductResponse.model_validate(p_dict)
+                product_responses.append(validated_product)
+            except ValidationError:
+                continue
+        
+        return {
+            "status": "SUCCESS",
+            "search_type": "CLIP_IMAGE_SIMILARITY",
+            "products": product_responses
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ CLIP search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/analyze-image")
 async def analyze_image_proxy(request: ImageAnalysisRequest):
-    AI_SERVICE_API_URL = settings.AI_SERVICE_API_URL.rstrip("/") # 끝에 슬래시 제거
+    """개별 이미지 분석 프록시"""
+    AI_SERVICE_API_URL = settings.AI_SERVICE_API_URL.rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            # AI Service 경로를 명확하게 지정
             target_url = f"{AI_SERVICE_API_URL}/analyze-image"
-            
-            # 만약 settings에 /api/v1이 없다면 추가해야 함. 
-            # 보통 AI_SERVICE_API_URL이 "http://ai-service-api:8000/api/v1" 이라면 위처럼, 
-            # "http://ai-service-api:8000" 이라면 아래처럼 수정:
             if "/api/v1" not in AI_SERVICE_API_URL:
                 target_url = f"{AI_SERVICE_API_URL}/api/v1/analyze-image"
 
@@ -73,21 +192,29 @@ async def analyze_image_proxy(request: ImageAnalysisRequest):
         logger.error(f"❌ Analysis Proxy Failed: {e}")
         raise HTTPException(status_code=500, detail=f"AI Service Error: {str(e)}")
 
+
 @router.post("/ai-search", response_model=Dict[str, Any])
 async def ai_search(
     query: str = Form(..., description="사용자 검색 쿼리"),
     image_file: Optional[UploadFile] = File(None),
-    limit: int = Form(10),
+    limit: int = Form(12),
     db: AsyncSession = Depends(deps.get_db),
 ) -> Any:
     """
-    [Hybrid] 통합 AI 기반 상품 검색 (Visual RAG + Text Context)
+    [Upgraded v2] 스마트 하이브리드 검색
+    - 키워드 매칭 우선 (일반 검색)
+    - ✅ EXTERNAL 경로: CLIP 이미지 벡터로 시각적 유사도 검색
+    - 성별 필터 자동 적용
     """
     logger.info(f"🔍 AI Search Request: '{query}' (Image: {image_file is not None})")
 
-    # 1. 성별 의도 파악
+    # 1. 의도 파악
     target_gender = detect_gender_intent(query)
+    core_keyword = extract_core_keyword(query)
+    is_celeb_search = is_celebrity_search(query)
     
+    logger.info(f"📌 Gender: {target_gender}, Core Keyword: '{core_keyword}', Celebrity: {is_celeb_search}")
+
     # 2. 이미지 처리
     image_b64: Optional[str] = None
     if image_file:
@@ -100,47 +227,49 @@ async def ai_search(
     # 3. AI Service 호출
     AI_SERVICE_API_URL = settings.AI_SERVICE_API_URL
     
-    search_strategy = "INTERNAL"
+    search_strategy = "SMART_HYBRID"
+    search_path = "INTERNAL"
     ai_summary = "검색 결과입니다."
     ref_image_url = None
-    candidates = [] 
+    candidates = []
     
     bert_vec: Optional[List[float]] = None
     clip_vec: Optional[List[float]] = None
     
-    # [복원] 재시도 로직 (안정성 확보)
+    # ✅ 항상 determine-path 호출
     max_retries = 3
     for attempt in range(max_retries):
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                # 3-1. 경로 결정
+                # 경로 결정 API 호출
                 path_res = await client.post(
-                    f"{AI_SERVICE_API_URL}/determine-path", 
+                    f"{AI_SERVICE_API_URL}/determine-path",
                     json={"query": query}
                 )
-                path = path_res.json().get("path", "INTERNAL") if path_res.status_code == 200 else "INTERNAL"
+                search_path = "INTERNAL"
+                if path_res.status_code == 200:
+                    search_path = path_res.json().get("path", "INTERNAL")
                 
-                # 3-2. 데이터 처리 요청
-                endpoint = "/process-external" if path == 'EXTERNAL' else "/process-internal"
+                logger.info(f"🛤️ Search Path Decision: {search_path}")
+                
+                # 경로에 따라 적절한 엔드포인트 호출
+                endpoint = "/process-external" if search_path == 'EXTERNAL' else "/process-internal"
                 payload = {"query": query, "image_b64": image_b64}
                 
-                ai_res = await client.post(
-                    f"{AI_SERVICE_API_URL}{endpoint}", 
-                    json=payload
-                )
+                ai_res = await client.post(f"{AI_SERVICE_API_URL}{endpoint}", json=payload)
                 ai_res.raise_for_status()
                 
                 data = ai_res.json()
                 
-                # 벡터 추출 (구조 안전하게 파싱)
+                # 벡터 추출
                 if "vectors" in data:
-                    vectors = data["vectors"]
-                    bert_vec = vectors.get("bert")
-                    clip_vec = vectors.get("clip")
+                    bert_vec = data["vectors"].get("bert")
+                    clip_vec = data["vectors"].get("clip")
+                    logger.info(f"📊 Vectors received - BERT: {len(bert_vec) if bert_vec else 0}dim, CLIP: {len(clip_vec) if clip_vec else 0}dim")
                 elif "vector" in data:
                     bert_vec = data["vector"]
                 
-                # 분석 데이터 추출
+                # AI 분석 결과 추출
                 if "ai_analysis" in data and data["ai_analysis"]:
                     analysis = data["ai_analysis"]
                     ai_summary = analysis.get("summary") or ai_summary
@@ -150,42 +279,83 @@ async def ai_search(
                     ai_summary = data.get("description") or data.get("reason") or ai_summary
                     ref_image_url = data.get("ref_image")
                 
-                search_strategy = data.get("strategy", path).upper()
+                search_strategy = data.get("strategy", search_path).upper()
                 
-                # [복원] 이미지 URL 프록시 처리 (필수)
+                # 외부 이미지 URL이면 프록시 처리
                 if ref_image_url and ref_image_url.startswith("http"):
-                    logger.info(f"🔄 Proxying image: {ref_image_url}")
+                    logger.info(f"🔄 Proxying reference image...")
                     proxy_image = await fetch_image_as_base64(ref_image_url)
                     if proxy_image:
                         ref_image_url = proxy_image
                 
-                break # 성공 시 탈출
+                break  # 성공 시 루프 탈출
 
         except Exception as e:
             logger.warning(f"⚠️ AI Service Retry ({attempt+1}/{max_retries}): {e}")
             if attempt == max_retries - 1:
-                search_strategy = "INTERNAL"
+                search_strategy = "KEYWORD_FALLBACK"
+                logger.error(f"❌ AI Service failed after {max_retries} retries")
             await asyncio.sleep(1)
 
-    # 4. Hybrid Search 실행
+    # 4. 🌟 검색 실행 - 경로에 따라 다른 전략
+    results = []
+    
     try:
-        results = await crud_product.search_hybrid(
-            db, 
-            bert_vector=bert_vec, 
-            clip_vector=clip_vec,
-            limit=limit, 
-            filter_gender=target_gender
-        )
-        
-        # 결과가 없으면 키워드 검색 Fallback
-        if not results and query:
-            results = await crud_product.search_keyword(
-                db, 
-                query=query, 
-                limit=limit, 
+        # ✅ 핵심 수정: EXTERNAL 경로 (연예인 패션 등) → CLIP 이미지 벡터로 검색
+        if search_path == "EXTERNAL" and clip_vec and len(clip_vec) == 512:
+            logger.info(f"🖼️ Using CLIP image vector search (512-dim)")
+            
+            # CLIP 이미지 벡터로 시각적 유사도 검색
+            results = await crud_product.search_by_clip_vector(
+                db,
+                clip_vector=clip_vec,
+                limit=limit,
                 filter_gender=target_gender
             )
-            search_strategy = "KEYWORD_FALLBACK" 
+            
+            if results:
+                search_strategy = "CLIP_VISUAL_SEARCH"
+                logger.info(f"✅ CLIP search found {len(results)} products")
+            else:
+                # CLIP 검색 결과 없으면 BERT로 Fallback
+                logger.info(f"⚠️ CLIP search empty, falling back to BERT")
+                if bert_vec and len(bert_vec) == 768:
+                    results = await crud_product.search_hybrid(
+                        db,
+                        bert_vector=bert_vec,
+                        limit=limit,
+                        filter_gender=target_gender
+                    )
+                    search_strategy = "BERT_FALLBACK"
+        
+        # INTERNAL 경로 또는 CLIP 벡터 없음 → 기존 스마트 하이브리드
+        if not results:
+            results = await crud_product.search_smart_hybrid(
+                db,
+                query=core_keyword,
+                bert_vector=bert_vec,
+                clip_vector=clip_vec,
+                limit=limit,
+                filter_gender=target_gender
+            )
+            
+            # 결과 없으면 전체 쿼리로 재시도
+            if not results:
+                results = await crud_product.search_smart_hybrid(
+                    db,
+                    query=query,
+                    bert_vector=bert_vec,
+                    clip_vector=clip_vec,
+                    limit=limit,
+                    filter_gender=None
+                )
+                if results:
+                    search_strategy = "RELAXED_SEARCH"
+        
+        # 그래도 없으면 최신 상품
+        if not results:
+            results = await crud_product.get_multi(db, limit=limit)
+            search_strategy = "FALLBACK_LATEST"
 
     except Exception as e:
         logger.error(f"❌ DB Search Error: {e}")
@@ -211,11 +381,14 @@ async def ai_search(
             }
             validated_product = ProductResponse.model_validate(p_dict)
             product_responses.append(validated_product)
-        except ValidationError: continue
+        except ValidationError:
+            continue
+
+    logger.info(f"✅ Search Complete: {len(product_responses)} products found (Strategy: {search_strategy})")
 
     return {
         "status": "SUCCESS",
-        "search_path": search_strategy, 
+        "search_path": search_strategy,
         "ai_analysis": {
             "summary": ai_summary,
             "reference_image": ref_image_url,

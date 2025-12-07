@@ -54,6 +54,19 @@ class InternalSearchRequest(BaseModel):
     query: str
     image_b64: Optional[str] = None
 
+# ✅ NEW: CLIP 벡터 생성 요청
+class ClipVectorRequest(BaseModel):
+    image_b64: str
+
+class ClipVectorResponse(BaseModel):
+    vector: List[float]
+    dimension: int
+
+# ✅ NEW: 이미지 기반 상품 검색 요청
+class ImageSearchRequest(BaseModel):
+    image_b64: str
+    limit: int = 12
+
 # --- Helper Methods (기존 코드 유지) ---
 
 def _fix_encoding(text: str) -> str:
@@ -214,14 +227,85 @@ async def analyze_image_endpoint(req: AnalyzeRequest):
 
 
 # -------------------------------------------------------------
-# 🔍 [수정됨] RAG Orchestrator 연결 (검색 로직 고도화)
+# ✅ [NEW] CLIP 이미지 벡터 생성 엔드포인트
+# -------------------------------------------------------------
+
+@api_router.post("/generate-clip-vector", response_model=ClipVectorResponse)
+async def generate_clip_vector(request: ClipVectorRequest):
+    """
+    이미지에서 CLIP 벡터(512차원) 생성
+    - 후보 이미지 클릭 시 상품 재검색에 사용
+    - 상품 등록 시 CLIP 벡터 저장에 사용
+    """
+    try:
+        image_b64 = request.image_b64
+        
+        # data:image/... 형식이면 base64 부분만 추출
+        if "base64," in image_b64:
+            image_b64 = image_b64.split("base64,")[1]
+        
+        # CLIP Vision 모델로 벡터 생성
+        result = model_engine.generate_image_embedding(image_b64)
+        clip_vector = result.get("clip", [])
+        
+        if not clip_vector or len(clip_vector) == 0:
+            raise HTTPException(status_code=500, detail="CLIP 벡터 생성 실패")
+        
+        logger.info(f"✅ CLIP vector generated: {len(clip_vector)} dimensions")
+        
+        return {
+            "vector": clip_vector,
+            "dimension": len(clip_vector)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ CLIP vector generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/search-by-image")
+async def search_by_image(request: ImageSearchRequest):
+    """
+    이미지 기반 상품 검색
+    - 후보 이미지 클릭 시 호출
+    - 이미지 → CLIP 벡터 → 유사 상품 검색
+    """
+    try:
+        image_b64 = request.image_b64
+        
+        if "base64," in image_b64:
+            image_b64 = image_b64.split("base64,")[1]
+        
+        # CLIP 벡터 생성
+        result = model_engine.generate_image_embedding(image_b64)
+        clip_vector = result.get("clip", [])
+        
+        if not clip_vector:
+            raise HTTPException(status_code=500, detail="CLIP 벡터 생성 실패")
+        
+        logger.info(f"🖼️ Image search: CLIP vector generated ({len(clip_vector)} dims)")
+        
+        return {
+            "vectors": {
+                "clip": clip_vector,
+                "bert": None
+            },
+            "search_type": "image_similarity"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Image search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------------------------------------------
+# 🔍 RAG Orchestrator 연결 (검색 로직 고도화)
 # -------------------------------------------------------------
 
 @api_router.post("/determine-path")
 async def determine_path(request: PathRequest):
     """
     사용자 쿼리를 분석하여 검색 경로(INTERNAL vs EXTERNAL)를 결정합니다.
-    [Updated] rag_orchestrator 호출
     """
     logger.info(f"🤔 Determining path for query: {request.query}")
     try:
@@ -236,7 +320,6 @@ async def determine_path(request: PathRequest):
 async def process_internal(request: InternalSearchRequest):
     """
     내부 검색 로직 실행
-    [Updated] rag_orchestrator 호출 (Dual Vector 생성)
     """
     logger.info(f"🏢 Processing Internal (Orchestrator): {request.query}")
     return await rag_orchestrator.process_internal_search(request.query)
@@ -245,16 +328,13 @@ async def process_internal(request: InternalSearchRequest):
 async def process_external(request: InternalSearchRequest):
     """
     외부(Google+RAG) 검색 로직 실행
-    [Updated] rag_orchestrator 호출 (Google Search + Vision RAG)
     """
     logger.info(f"🌍 Processing External (Orchestrator): {request.query}")
     try:
-        # 오케스트레이터가 Google Search -> Image Download -> CLIP/BERT Embedding까지 수행
         result = await rag_orchestrator.process_external_rag(request.query)
         return result
     except Exception as e:
         logger.error(f"External processing failed: {e}")
-        # 실패 시 내부 검색으로 Fallback
         return await rag_orchestrator.process_internal_search(request.query)
 
 app.include_router(api_router)

@@ -367,7 +367,7 @@ async def llm_query_product(
 # --- AI Coordination ---
 @router.get("/ai-coordination/{product_id}", response_model=CoordinationResponse)
 async def get_ai_coordination_products(
-    product_id: int,
+    product_id: int, 
     db: AsyncSession = Depends(deps.get_db),
     current_user: Any = Depends(deps.get_current_user),
 ) -> CoordinationResponse:
@@ -378,7 +378,14 @@ async def get_ai_coordination_products(
 
     product = await _heal_product_embedding(db, product)
     
-    if not product.embedding:
+    
+    has_embedding = (
+        product.embedding is not None and 
+        hasattr(product.embedding, '__len__') and 
+        len(product.embedding) > 0
+    )
+    
+    if not has_embedding:
         raise HTTPException(status_code=503, detail="AI Service is currently unavailable to analyze this product.")
     
     coordination_prompt = (
@@ -390,7 +397,6 @@ async def get_ai_coordination_products(
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            # [FIX] 중복 경로 제거
             llm_res = await client.post(
                 f"{AI_SERVICE_API_URL}/llm-generate-response", 
                 json={"prompt": coordination_prompt}
@@ -405,17 +411,16 @@ async def get_ai_coordination_products(
             logger.error(f"LLM Keyword Generation failed: {e}")
 
     embedding_text = f"{product.name} 코디 {' '.join(coordination_keywords)}"
-    coordination_vector = product.embedding
+    coordination_vector = list(product.embedding) if product.embedding is not None else []
     
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            # [FIX] 중복 경로 제거
             vector_res = await client.post(
                 f"{AI_SERVICE_API_URL}/embed-text", 
                 json={"text": embedding_text}
             )
             if vector_res.status_code == 200:
-                coordination_vector = vector_res.json().get("vector", product.embedding)
+                coordination_vector = vector_res.json().get("vector", coordination_vector)
         except Exception as e:
             logger.error(f"Embedding API failed: {e}")
 

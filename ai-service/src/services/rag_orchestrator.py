@@ -1,3 +1,5 @@
+
+
 import asyncio
 import logging
 import aiohttp
@@ -18,6 +20,21 @@ class AIOrchestrator:
         self.engine = model_engine
         self.search_client = GoogleSearchClient()
         self.semaphore = asyncio.Semaphore(5)
+        
+        # ✅ 확장된 외부 검색 트리거 키워드
+        self.external_triggers = [
+            # 패션 관련
+            "스타일", "코디", "패션", "룩", "유행", "트렌드",
+            # 연예인/인물 관련
+            "연예인", "공항", "입은", "착용", "옷", "의상",
+            # 행동 관련
+            "추천", "보여줘", "찾아줘", "알려줘",
+            # 영어 키워드
+            "style", "fashion", "look", "outfit", "wear"
+        ]
+        
+        # ✅ 한글 이름 패턴 (2-4글자 한글 이름)
+        self.korean_name_pattern = re.compile(r'[가-힣]{2,4}')
 
     async def _download_image(self, session: aiohttp.ClientSession, url: str) -> Optional[Image.Image]:
         async with self.semaphore:
@@ -33,51 +50,59 @@ class AIOrchestrator:
                         image = Image.open(BytesIO(data)).convert("RGB")
                         if image.width < 250 or image.height < 250: return None
                         return image
-            except Exception: return None
+            except Exception as e:
+                logger.debug(f"Image download failed: {url} - {e}")
+                return None
         return None
 
-    # [수정] 화질 개선 (85 -> 95)
     def _image_to_base64(self, image: Image.Image) -> str:
         try:
             buffered = BytesIO()
-            # [핵심] VLM이 디테일을 볼 수 있도록 고화질 유지
             image.save(buffered, format="JPEG", quality=95)
             img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
             return f"data:image/jpeg;base64,{img_str}"
         except Exception: return ""
 
     def _optimize_query(self, user_query: str) -> str:
-        # (기존 코드 유지: 조사 제거 및 LLM 최적화)
-        prompt = f"""
-        Role: Search Query Optimizer.
-        Task: Convert natural language to short keywords.
-        Input: "{user_query}"
+        """검색 쿼리 최적화 - 한글 이름 보존"""
+        # 불용어 목록
+        stop_words = [
+            "추천해줘", "보여줘", "찾아줘", "알려줘", "어때", 
+            "사진", "이미지", "10분만에", "꼬셨던", "좀", "해줘",
+            "뭐", "어디", "누구", "언제", "어떻게"
+        ]
         
-        Rules:
-        1. Remove Particles: Remove Korean particles like '가', '는', '을', '를'.
-        2. Remove Context: Remove "10분만에", "꼬신", "남자".
-        3. Output: "Celebrity Name" + "Style Keywords" (e.g. "Lee Hyori Y2K Fashion").
-        """
-        try:
-            optimized = self.engine.generate_text(prompt).strip()
-            if len(optimized) < 30 and len(optimized) > 2:
-                return optimized
-        except: pass
-
         words = user_query.split()
         keywords = []
-        stop_words = ["추천해줘", "보여줘", "찾아줘", "알려줘", "어때", "사진", "이미지", "10분만에", "꼬셨던", "남자"]
         
         for w in words:
-            clean_w = re.sub(r'(은|는|이|가|을|를|의|에|로)$', '', w)
-            if clean_w not in stop_words and len(clean_w) > 1:
-                keywords.append(clean_w)
+            # 조사 제거
+            clean_w = re.sub(r'(은|는|이|가|을|를|의|에|로|으로|와|과|도|만|까지|부터)$', '', w)
+            
+            # 불용어 체크
+            if clean_w in stop_words:
+                continue
+            
+            # 최소 길이 체크
+            if len(clean_w) < 2:
+                continue
+                
+            keywords.append(clean_w)
         
-        if not keywords: return user_query
-        return " ".join(keywords)
+        if not keywords:
+            return user_query
+            
+        # 패션 관련 키워드 추가 (검색 품질 향상)
+        optimized = " ".join(keywords)
+        if "패션" not in optimized and "스타일" not in optimized:
+            optimized += " 패션 스타일"
+            
+        logger.info(f"🔍 Query optimized: '{user_query}' -> '{optimized}'")
+        return optimized
 
     def _get_scoring_context(self, query: str) -> str:
-        if any(k in query for k in ["가방", "신발", "지갑"]): return "close up product shot"
+        if any(k in query for k in ["가방", "신발", "지갑", "액세서리"]): 
+            return "close up product shot"
         return "full body fashion style"
 
     def _normalize_score(self, raw_score: float) -> int:
@@ -86,17 +111,28 @@ class AIOrchestrator:
         return int(min(max(normalized, 60), 99))
 
     async def process_external_rag(self, query: str) -> Dict[str, Any]:
+        """외부 이미지 검색 + VLM 분석"""
         logger.info(f"🌍 Processing EXTERNAL RAG: {query}")
-        allowed, _ = quota_monitor.check_and_increment()
-        if not allowed: return await self.process_internal_search(query)
+        
+        # 쿼터 체크
+        allowed, reason = quota_monitor.check_and_increment()
+        if not allowed:
+            logger.warning(f"⚠️ Quota exceeded: {reason}")
+            return await self.process_internal_search(query)
 
         optimized_query = self._optimize_query(query)
         
+        # Google 이미지 검색
+        logger.info(f"🔎 Searching Google Images: '{optimized_query}'")
         search_results = await self.search_client.search_images(
             optimized_query, num_results=15, start_index=1
         )
         
-        if not search_results: return await self.process_internal_search(query)
+        if not search_results:
+            logger.warning("❌ No search results from Google")
+            return await self.process_internal_search(query)
+            
+        logger.info(f"✅ Found {len(search_results)} images")
 
         best_image = None
         candidates_data = []
@@ -134,8 +170,11 @@ class AIOrchestrator:
                         "image_base64": self._image_to_base64(cand['image']),
                         "score": cand['display_score']
                     })
+                    
+        logger.info(f"📊 Valid candidates: {len(scored_candidates)}")
 
         if not best_image:
+            logger.warning("❌ No valid images after scoring")
             return await self.process_internal_search(query)
 
         summary = await self._analyze_image_with_vlm(best_image, query)
@@ -167,15 +206,14 @@ class AIOrchestrator:
         except Exception:
             return "이미지 분석에 실패했습니다."
 
-    # [핵심 수정] VLM 분석 프롬프트 강화 (Grounding)
     async def _analyze_image_with_vlm(self, image_data: Any, query: str) -> str:
+        """VLM을 이용한 이미지 분석"""
         try:
             if isinstance(image_data, Image.Image):
                 img_b64 = self._image_to_base64(image_data).split(",")[1]
             else:
                 img_b64 = image_data
 
-            # [Grounding Prompt] "보이는 것만 묘사하라"는 강력한 제약 추가
             vlm_prompt = f"""
             당신은 정직한 패션 에디터입니다.
             **오직 이미지에 시각적으로 보이는 것만** 설명하세요. 
@@ -191,10 +229,13 @@ class AIOrchestrator:
             반드시 한국어로 작성하세요.
             """
             return self.engine.generate_with_image(vlm_prompt, img_b64)
-        except Exception:
+        except Exception as e:
+            logger.error(f"VLM analysis failed: {e}")
             return "분석 불가"
 
     async def process_internal_search(self, query: str) -> Dict[str, Any]:
+        """내부 텍스트 검색"""
+        logger.info(f"📦 Processing INTERNAL search: {query}")
         vectors = self.engine.generate_dual_embedding(query)
         return {
             "vectors": vectors,
@@ -206,8 +247,38 @@ class AIOrchestrator:
         }
 
     async def determine_search_path(self, query: str) -> str:
-        external_triggers = ["스타일", "코디", "패션", "룩", "유행", "연예인", "공항", "입은", "추천"]
-        if any(t in query for t in external_triggers): return 'EXTERNAL'
+        """
+        ✅ 수정: 외부 검색 트리거 조건 확장
+        - 트리거 키워드 포함 시 EXTERNAL
+        - 한글 이름(2-4글자) + 패션 관련 키워드 조합 시 EXTERNAL
+        """
+        query_lower = query.lower()
+        
+        # 1. 기본 트리거 키워드 체크
+        if any(t in query_lower for t in self.external_triggers):
+            logger.info(f"🎯 External trigger found in: '{query}'")
+            return 'EXTERNAL'
+        
+        # 2. 한글 이름 + 패션 관련 단어 조합 체크
+        korean_names = self.korean_name_pattern.findall(query)
+        fashion_keywords = ["패션", "스타일", "코디", "룩", "옷", "착용", "공항", "입은"]
+        
+        if korean_names and any(k in query for k in fashion_keywords):
+            logger.info(f"🎯 Korean name + fashion keyword found: '{query}' (names: {korean_names})")
+            return 'EXTERNAL'
+        
+        # 3. 유명인 이름 패턴 (이름 + 패션/스타일/공항 등)
+        celebrity_patterns = [
+            r'[가-힣]{2,4}\s*(패션|스타일|코디|룩|옷|공항|착장|의상)',
+            r'(신세경|제니|지수|로제|리사|아이유|수지|송혜교|김태리|한소희|차은우|뷔|정국|지민).*'
+        ]
+        
+        for pattern in celebrity_patterns:
+            if re.search(pattern, query):
+                logger.info(f"🎯 Celebrity pattern matched: '{query}'")
+                return 'EXTERNAL'
+        
+        logger.info(f"📦 No external trigger, using INTERNAL: '{query}'")
         return 'INTERNAL'
 
 rag_orchestrator = AIOrchestrator()
