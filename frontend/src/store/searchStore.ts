@@ -20,9 +20,7 @@ export const useSearchStore = create<SearchState>()(
 
       addRecentSearch: (keyword) =>
         set((state) => {
-          // 중복 제거 및 최신 검색어가 위로 오도록 정렬
           const filtered = state.recentSearches.filter((item) => item !== keyword);
-          // 최대 10개까지만 저장
           return { recentSearches: [keyword, ...filtered].slice(0, 10) };
         }),
 
@@ -44,7 +42,7 @@ export const useSearchStore = create<SearchState>()(
         }),
     }),
     {
-      name: 'search-history-storage', // 로컬 스토리지 키 이름
+      name: 'search-history-storage',
     }
   )
 );

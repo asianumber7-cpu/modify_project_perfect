@@ -1,10 +1,15 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Search as SearchIcon, Mic, UploadCloud, X, Loader2, Volume2, AlertCircle } from 'lucide-react';
+import { 
+  Search as SearchIcon, Mic, X, Sparkles, TrendingUp, 
+  MessageCircle, Check, Image as ImageIcon, ShoppingBag, 
+  AlertCircle, RefreshCw, ArrowDown, ArrowUp, Filter
+} from 'lucide-react';
 import client from '../api/client';
 import ProductCard from '../components/product/ProductCard';
+import { useSearchStore } from '../store/searchStore';
 
-// Mock Data Types
+// --- Types ---
 interface ProductResponse {
     id: number;
     name: string;
@@ -12,162 +17,198 @@ interface ProductResponse {
     price: number;
     category: string;
     image_url: string;
-    in_stock: boolean;
+    stock_quantity: number;
+    in_stock?: boolean;
+    gender?: string;
+    is_active?: boolean;
+}
+
+interface CandidateImage {
+    image_base64: string;
+    score: number;
 }
 
 interface SearchResult {
-    status: 'SUCCESS' | 'FAILURE';
-    answer: string;
+    status: string;
+    ai_analysis?: {
+        summary: string;
+        reference_image?: string;
+        candidates?: CandidateImage[];
+    };
     products: ProductResponse[];
-    search_path: 'INTERNAL' | 'EXTERNAL';
 }
 
-// 환경 변수 처리 (Vite)
-const API_ENDPOINT = '/search/ai-search'; // client의 baseURL이 적용되므로 상대 경로 사용
+const API_ENDPOINT = '/search/ai-search';
 
 const useSearchQuery = () => {
     const [searchParams] = useSearchParams();
     return searchParams.get('q') || '';
 };
 
-// TTS 유틸리티
 const useTTS = () => {
     const speak = useCallback((text: string) => {
         if ('speechSynthesis' in window) {
-            // 기존 발화 취소 (새로운 내용 우선)
             window.speechSynthesis.cancel();
-            
             const utterance = new SpeechSynthesisUtterance(text);
             utterance.lang = 'ko-KR';
-            utterance.rate = 1.0; // 속도 조절
+            utterance.rate = 1.0; 
             window.speechSynthesis.speak(utterance);
-        } else {
-            console.warn("TTS is not supported in this browser.");
         }
     }, []);
     return { speak };
 };
 
-export default function SearchPage() {
+const LOADING_STEPS = [
+    { text: "글로벌 트렌드를 검색하고 있습니다...", icon: "🌍" },
+    { text: "가장 적절한 이미지를 선별 중입니다...", icon: "🖼️" },
+    { text: "패션 스타일과 핏을 정밀 분석 중입니다...", icon: "✨" },
+    { text: "Vogue 스타일 칼럼을 작성하고 있습니다...", icon: "📝" }
+];
+
+export default function Search() {
     const queryTextFromUrl = useSearchQuery();
+    const { addRecentSearch } = useSearchStore();
+
     const [query, setQuery] = useState(queryTextFromUrl);
     const [imageFile, setImageFile] = useState<File | null>(null);
     const [results, setResults] = useState<ProductResponse[]>([]);
-    const [answer, setAnswer] = useState<string | null>(null);
-    const [isLoading, setIsLoading] = useState(false);
-    const [isError, setIsError] = useState(false);
-    const fileInputRef = useRef<HTMLInputElement>(null);
     
+    // AI 분석 상태
+    const [aiAnalysis, setAiAnalysis] = useState<SearchResult['ai_analysis'] | null>(null);
+    const [selectedImage, setSelectedImage] = useState<string | null>(null);
+    const [currentText, setCurrentText] = useState<string>("");
+    
+    // UI 상태
+    const [isAnalyzingImage, setIsAnalyzingImage] = useState(false);
+    const [showProducts, setShowProducts] = useState(false);
+    const [isLoading, setIsLoading] = useState(false);
+    const [loadingStepIndex, setLoadingStepIndex] = useState(0); 
+    const [timestamp, setTimestamp] = useState<number>(Date.now());
+
+    const fileInputRef = useRef<HTMLInputElement>(null);
+    const productSectionRef = useRef<HTMLDivElement>(null);
     const { speak } = useTTS();
 
-    // 파일 핸들링
+    useEffect(() => {
+        if (isLoading) {
+            const interval = setInterval(() => {
+                setLoadingStepIndex((prev) => (prev + 1) % LOADING_STEPS.length);
+            }, 800); 
+            return () => clearInterval(interval);
+        } else {
+            setLoadingStepIndex(0);
+        }
+    }, [isLoading]);
+
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
-        if (file) {
-            if (!file.type.startsWith('image/')) {
-                alert('이미지 파일만 업로드할 수 있습니다.');
-                return;
-            }
-            setImageFile(file);
-        }
+        if (file && file.type.startsWith('image/')) setImageFile(file);
     };
 
-    const handleImageDrop = useCallback((e: React.DragEvent<HTMLDivElement>) => {
-        e.preventDefault();
-        const file = e.dataTransfer.files[0];
-        if (file && file.type.startsWith('image/')) {
-            setImageFile(file);
-        } else {
-            alert('이미지 파일을 드래그해주세요.');
-        }
-    }, []);
-
-    // 음성 인식 (Feature 8)
-    const handleVoiceSearch = () => {
-        if (!('webkitSpeechRecognition' in window)) {
-            alert('브라우저가 음성 인식을 지원하지 않습니다. Chrome 사용을 권장합니다.');
-            return;
-        }
-
-        const recognition = new (window as any).webkitSpeechRecognition();
-        recognition.continuous = false;
-        recognition.lang = 'ko-KR';
-        recognition.interimResults = false;
-        recognition.maxAlternatives = 1;
-
-        recognition.onstart = () => speak("듣고 있습니다. 검색어를 말씀해 주세요.");
-
-        recognition.onresult = (event: any) => {
-            const transcript = event.results[0][0].transcript;
-            setQuery(transcript);
-            // 음성 인식 성공 시 즉시 검색 트리거 (isVoice: true)
-            handleSearch(transcript, imageFile, true); 
-        };
-
-        recognition.onerror = (event: any) => {
-            console.error('Speech recognition error:', event.error);
-            speak('죄송합니다. 음성을 잘 못 들었습니다.');
-        };
-
-        recognition.start();
+    const getBustedImage = (url: string) => {
+        if (!url) return '';
+        if (url.startsWith('data:')) return url;
+        const separator = url.includes('?') ? '&' : '?';
+        return `${url}${separator}t=${timestamp}`;
     };
 
-    // 통합 검색 실행
-    // isVoice 파라미터 추가: 음성 검색 여부 판별
+    // [핵심] 검색 로직
     const handleSearch = useCallback(async (currentQuery: string, currentImage: File | null, isVoice: boolean = false) => {
-        if (!currentQuery && !currentImage) {
-            if (isVoice) speak('검색어 또는 이미지가 확인되지 않았습니다.');
-            return;
-        }
+        if (!currentQuery && !currentImage) return;
+        if (currentQuery) addRecentSearch(currentQuery);
 
         setIsLoading(true);
-        setIsError(false);
         setResults([]);
-        setAnswer(null);
+        setAiAnalysis(null);
+        setSelectedImage(null);
+        setCurrentText("");
+        setShowProducts(false);
+        setTimestamp(Date.now());
 
-        // API 호출용 FormData
         const formData = new FormData();
         formData.append('query', currentQuery);
-        if (currentImage) {
-            formData.append('image_file', currentImage);
-        }
+        if (currentImage) formData.append('image_file', currentImage);
+        formData.append('limit', '12');
 
         try {
-            // client 인스턴스 사용 (Base URL, Interceptor 적용)
             const response = await client.post<SearchResult>(API_ENDPOINT, formData, {
                 headers: { 'Content-Type': 'multipart/form-data' }
             });
 
             const data = response.data;
-            setAnswer(data.answer);
-            setResults(data.products);
+            setResults(data.products || []);
             
-            // Feature 8 수정: 음성 검색(isVoice=true)일 때만 TTS 작동
-            // + 모든 상품명이 아닌 AI 요약 답변(data.answer)만 읽음
-            if (data.status === 'SUCCESS' && data.answer && isVoice) {
-                speak(data.answer);
+            if (data.ai_analysis && data.ai_analysis.reference_image) {
+                setAiAnalysis(data.ai_analysis);
+                setSelectedImage(data.ai_analysis.reference_image);
+                setCurrentText(data.ai_analysis.summary);
+                
+                if (isVoice) speak(data.ai_analysis.summary);
+            } else {
+                setShowProducts(true);
             }
 
         } catch (error: any) {
-            console.error(error);
-            const errorMessage = '검색 처리 중 오류가 발생했습니다.';
-            setIsError(true);
-            setResults([]);
-            if (isVoice) speak(errorMessage);
+            console.error("Search failed:", error);
         } finally {
             setIsLoading(false);
         }
-    }, [speak]);
+    }, [speak, addRecentSearch]);
 
-    // 폼 제출 (엔터 키 or 버튼 클릭) -> 음성 아님(false)
+    // [복원] 음성 검색 로직 (누락되었던 부분)
+    const handleVoiceSearch = () => {
+        if (!('webkitSpeechRecognition' in window)) {
+            alert('Chrome 브라우저를 사용해주세요.');
+            return;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const recognition = new (window as any).webkitSpeechRecognition();
+        recognition.lang = 'ko-KR';
+        recognition.onstart = () => speak("듣고 있습니다.");
+        recognition.onresult = (event: any) => {
+            const transcript = event.results[0][0].transcript;
+            setQuery(transcript);
+            handleSearch(transcript, imageFile, true); 
+        };
+        recognition.start();
+    };
+
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
         handleSearch(query, imageFile, false);
     };
-    
+
+    const handleAnalyzeSelectedImage = async () => {
+        if (!selectedImage || !query) return;
+        setIsAnalyzingImage(true);
+        try {
+            const response = await client.post('/search/analyze-image', {
+                image_b64: selectedImage,
+                query: query
+            });
+            setCurrentText(response.data.analysis);
+        } catch (e) {
+            console.error(e);
+            setCurrentText("상세 분석에 실패했습니다. 잠시 후 다시 시도해주세요.");
+        } finally {
+            setIsAnalyzingImage(false);
+        }
+    };
+
+    // [복원] 상품 보기 핸들러 (버튼 클릭 시 스크롤 이동)
+    const handleShowProducts = () => {
+        setShowProducts(true);
+        setTimeout(() => {
+            productSectionRef.current?.scrollIntoView({ behavior: 'smooth' });
+        }, 100);
+    };
+
+    const handleScrollTop = () => {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    };
+
     const previewUrl = imageFile ? URL.createObjectURL(imageFile) : null;
 
-    // Deep Linking 처리 (URL 쿼리 파라미터) -> 음성 아님(false)
     useEffect(() => {
         if (queryTextFromUrl) {
             setQuery(queryTextFromUrl);
@@ -176,149 +217,217 @@ export default function SearchPage() {
     }, [queryTextFromUrl, handleSearch]);
 
     return (
-        <div className="max-w-6xl mx-auto p-6 space-y-8">
-            <h1 className="text-3xl font-bold text-gray-900">AI 통합 검색</h1>
+        <div className="max-w-7xl mx-auto p-6 space-y-8 pb-40">
+            {/* 헤더 & 검색바 */}
+            <h1 className="text-3xl font-bold text-gray-900 flex items-center gap-2">
+                <Sparkles className="w-8 h-8 text-purple-600" /> AI 통합 검색
+            </h1>
 
-            {/* 검색 입력 영역 */}
-            <form onSubmit={handleSubmit} className="bg-white rounded-xl shadow-lg p-6 border border-gray-100">
+            <form onSubmit={handleSubmit} className="bg-white rounded-xl shadow-lg p-6 border border-gray-100 transition-shadow hover:shadow-xl">
                 <div className="flex items-center space-x-3 mb-4">
-                    <SearchIcon className="w-5 h-5 text-gray-500" />
+                    <SearchIcon className="w-6 h-6 text-gray-400" />
                     <input
                         type="text"
                         value={query}
                         onChange={(e) => setQuery(e.target.value)}
-                        placeholder="예: 청룡 영화제 아이유가 입은 코트 또는 빨간색 니트"
-                        className="flex-1 text-lg border-none focus:ring-0 outline-none placeholder:text-gray-400"
-                        aria-label="검색어 입력"
+                        placeholder="예: 장원영 공항 패션, 시사회 룩..."
+                        className="flex-1 text-xl border-none focus:ring-0 outline-none placeholder:text-gray-300 font-medium"
                     />
-                    <button 
-                        type="button" 
-                        onClick={handleVoiceSearch}
-                        className="p-2 rounded-full hover:bg-gray-100 transition-colors"
-                        aria-label="음성 검색 시작"
-                    >
-                        <Mic className="w-5 h-5 text-blue-500" />
+                    <button type="button" onClick={handleVoiceSearch} className="p-3 rounded-full hover:bg-purple-50 transition-colors">
+                        <Mic className="w-6 h-6 text-purple-500" />
                     </button>
-                    <button 
-                        type="submit" 
-                        disabled={isLoading || (!query && !imageFile)}
-                        className="px-4 py-2 bg-black text-white rounded-lg font-medium hover:bg-gray-800 disabled:opacity-50 transition-colors"
-                    >
-                        {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : '검색'}
+                    <button type="submit" disabled={isLoading} className="px-8 py-3 bg-purple-600 text-white rounded-xl font-bold hover:bg-purple-700 transition-all active:scale-95">
+                        검색
                     </button>
                 </div>
-
-                {/* 이미지 업로드/미리보기 */}
-                <div 
-                    className={`mt-4 border-2 border-dashed rounded-lg p-4 transition-colors ${
-                        imageFile ? 'border-green-400' : 'border-gray-300 hover:border-gray-400'
-                    }`}
-                    onDrop={handleImageDrop}
-                    onDragOver={(e) => e.preventDefault()}
-                >
-                    {imageFile ? (
-                        <div className="flex items-center space-x-4">
-                            <img src={previewUrl || ''} alt="업로드 이미지 미리보기" className="w-16 h-16 object-cover rounded-md" />
-                            <div className="flex-1">
-                                <p className="text-sm font-medium text-gray-700">{imageFile.name}</p>
-                                <p className="text-xs text-gray-500">클릭하여 교체하거나 X를 눌러 삭제</p>
-                            </div>
-                            <button onClick={() => setImageFile(null)} type="button" className="text-gray-500 hover:text-red-500" aria-label="이미지 삭제">
-                                <X className="w-5 h-5" />
-                            </button>
-                        </div>
-                    ) : (
-                        <div className="text-center">
-                            <input
-                                type="file"
-                                accept="image/*"
-                                ref={fileInputRef}
-                                onChange={handleFileChange}
-                                className="hidden"
-                                id="image-upload-btn"
-                            />
-                            <label htmlFor="image-upload-btn" className="flex flex-col items-center cursor-pointer p-4">
-                                <UploadCloud className="w-8 h-8 text-gray-400" />
-                                <p className="text-sm text-gray-500 mt-2">이미지를 드래그하거나 클릭하여 업로드</p>
-                            </label>
-                        </div>
-                    )}
-                </div>
+                {!isLoading && (
+                    <div {...(imageFile ? {} : {onClick: () => fileInputRef.current?.click()})} className="cursor-pointer">
+                         <input type="file" accept="image/*" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
+                         {imageFile ? (
+                             <div className="mt-2 flex items-center gap-2 bg-purple-50 p-2 rounded-lg w-fit animate-in fade-in">
+                                <img src={previewUrl || ''} className="w-10 h-10 rounded object-cover" alt="preview"/>
+                                <span className="text-sm text-purple-700 font-medium">{imageFile.name}</span>
+                                <X className="w-4 h-4 cursor-pointer hover:text-red-500" onClick={(e) => {e.stopPropagation(); setImageFile(null)}}/>
+                             </div>
+                         ) : (
+                             <p className="text-xs text-gray-400 text-center mt-2 hover:text-purple-500 transition-colors">이미지를 드래그하거나 클릭하여 업로드</p>
+                         )}
+                    </div>
+                )}
             </form>
 
-            {/* 검색 결과 */}
-            <div className="pt-6">
-                <h2 className="text-xl font-semibold mb-4">검색 결과 ({results.length}개)</h2>
-                
-                {isLoading && (
-                    <div className="flex flex-col items-center py-10">
-                        <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
-                        <p className="mt-4 text-gray-600">
-                            AI가 복잡한 검색을 분석 중입니다. 잠시만 기다려주세요...
-                        </p>
-                    </div>
-                )}
-
-                {!isLoading && isError && (
-                    <div className="text-center py-10 text-red-500 bg-red-50 rounded-lg">
-                        <AlertCircle className="w-6 h-6 mx-auto mb-2" />
-                        <p>통합 검색 중 오류가 발생했습니다.</p>
-                    </div>
-                )}
-
-                {/* AI 추천 답변 */}
-                {!isLoading && !isError && answer && (
-                    <div className="mb-10 p-6 bg-purple-50 rounded-2xl border border-purple-100 shadow-sm">
-                        <h3 className="font-bold text-lg mb-2 text-purple-800 flex items-center gap-2">
-                            <span className="text-xl">💡</span> AI 스타일리스트 추천
-                            <button onClick={() => speak(answer)} className="p-1 rounded-full hover:bg-purple-100 transition-colors" aria-label="AI 답변 듣기">
-                                <Volume2 className="w-4 h-4 text-purple-600" />
-                            </button>
-                        </h3>
-                        <p className="text-gray-700 leading-relaxed whitespace-pre-wrap">
-                            {answer}
-                        </p>
-                    </div>
-                )}
-
-                {/* 상품 리스트 */}
-                {!isLoading && !isError && results.length > 0 ? (
-                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-6">
-                        {results.map((product) => (
-                            <ProductCard key={product.id} product={product} /> 
-                        ))}
-                    </div>
-                ) : (
-                     !isLoading && !isError && (queryTextFromUrl || imageFile) && results.length === 0 && (
-                        <div className="text-center py-10 text-gray-500">
-                            검색 결과가 없습니다.
+            {/* 로딩 애니메이션 */}
+            {isLoading && (
+                <div className="flex flex-col items-center py-24 animate-in fade-in duration-500">
+                    <div className="relative">
+                        <div className="absolute inset-0 bg-purple-200 rounded-full animate-ping opacity-75"></div>
+                        <div className="relative bg-white p-6 rounded-full shadow-lg border border-purple-100">
+                            <span className="text-5xl animate-bounce">{LOADING_STEPS[loadingStepIndex].icon}</span>
                         </div>
-                    )
-                )}
+                    </div>
+                    <h3 className="mt-8 text-xl font-bold text-gray-800 transition-all duration-300 min-h-[28px] text-center">
+                        {LOADING_STEPS[loadingStepIndex].text}
+                    </h3>
+                </div>
+            )}
 
-                {/* 하단 꼬리물기 검색 UI */}
-                <div className="mt-12 fixed bottom-8 left-0 right-0 px-4 md:px-0 max-w-3xl mx-auto z-50 pointer-events-none">
-                     <div className="bg-white/80 backdrop-blur-lg border border-gray-200 rounded-2xl shadow-2xl p-4 flex gap-3 ring-1 ring-black/5 pointer-events-auto">
-                        <div className="w-10 h-10 bg-indigo-600 rounded-full flex items-center justify-center text-white shrink-0 shadow-md">
-                            AI
+            {/* [1단계] Visual RAG 리포트 */}
+            {!isLoading && aiAnalysis && (
+                <div className="mb-12 bg-white rounded-2xl p-6 border border-gray-100 shadow-sm animate-in zoom-in-95 duration-500">
+                    <div className="flex flex-col md:flex-row gap-8 items-start">
+                        {/* 이미지 & 후보군 */}
+                        <div className="w-full md:w-1/3 flex-shrink-0 flex flex-col gap-4">
+                            <div className="relative rounded-xl overflow-hidden bg-gray-100 shadow-md group aspect-[3/4]">
+                                <img 
+                                    src={getBustedImage(selectedImage || aiAnalysis.reference_image || '')} 
+                                    alt="Trend Ref" 
+                                    referrerPolicy="no-referrer"
+                                    className="object-cover w-full h-full group-hover:scale-105 transition-transform duration-500" 
+                                />
+                                <div className="absolute top-3 left-3 bg-black/60 backdrop-blur-sm text-white text-xs px-3 py-1.5 rounded-full flex gap-1.5 items-center">
+                                    <TrendingUp className="w-3 h-3" /> Trend Reference
+                                </div>
+                            </div>
+                            
+                            {aiAnalysis.candidates && aiAnalysis.candidates.length > 0 && (
+                                <div className="animate-in slide-in-from-bottom-2 fade-in">
+                                    <p className="text-xs text-gray-500 mb-2 font-medium ml-1 flex items-center gap-1">
+                                        <ImageIcon className="w-3 h-3"/> 다른 스타일 보기
+                                    </p>
+                                    <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-hide snap-x">
+                                        {aiAnalysis.candidates.map((cand, idx) => (
+                                            <button 
+                                                key={idx}
+                                                onClick={() => setSelectedImage(cand.image_base64)}
+                                                className={`relative w-16 h-20 rounded-lg overflow-hidden flex-shrink-0 border-2 transition-all snap-start ${
+                                                    selectedImage === cand.image_base64 
+                                                    ? 'border-purple-600 ring-2 ring-purple-100 scale-105' 
+                                                    : 'border-transparent hover:border-gray-300 opacity-80 hover:opacity-100'
+                                                }`}
+                                            >
+                                                <img 
+                                                    src={getBustedImage(cand.image_base64)} 
+                                                    referrerPolicy="no-referrer"
+                                                    className="w-full h-full object-cover" 
+                                                    alt={`candidate ${idx}`} 
+                                                />
+                                                <div className="absolute bottom-0 w-full bg-black/50 text-[9px] text-white text-center py-0.5">
+                                                    {cand.score}%
+                                                </div>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
                         </div>
-                        <input 
-                            type="text" 
-                            placeholder="여기에 어울리는 하의를 추천해줄래?"
-                            className="w-full bg-transparent outline-none text-gray-800 placeholder-gray-400"
-                            aria-label="후속 검색 질문"
-                            // 추후 기능 구현 예정 (엔터 시 handleSearch 호출 등)
-                            onKeyDown={(e) => {
-                                if (e.key === 'Enter') {
-                                    setQuery(e.currentTarget.value);
-                                    handleSearch(e.currentTarget.value, null, false);
-                                    e.currentTarget.value = '';
-                                }
-                            }}
-                        />
+
+                        {/* 텍스트 & 액션 버튼 */}
+                        <div className="flex-1 py-2 space-y-6">
+                            <div className="bg-purple-50/50 rounded-2xl p-8 border border-purple-100 relative shadow-sm min-h-[300px]">
+                                <div className="flex items-center justify-between mb-4">
+                                    <div className="flex items-center gap-2">
+                                        <Sparkles className="w-5 h-5 text-purple-600" />
+                                        <h2 className="text-lg font-bold text-gray-800">스타일 분석 리포트</h2>
+                                    </div>
+                                    
+                                    {/* 개별 분석 버튼 */}
+                                    {selectedImage && selectedImage !== aiAnalysis.reference_image && (
+                                        <button 
+                                            onClick={handleAnalyzeSelectedImage}
+                                            disabled={isAnalyzingImage}
+                                            className="text-xs bg-white border border-purple-200 text-purple-700 px-3 py-1.5 rounded-full hover:bg-purple-50 transition-colors flex items-center gap-1 shadow-sm"
+                                        >
+                                            {isAnalyzingImage ? <RefreshCw className="w-3 h-3 animate-spin"/> : <Sparkles className="w-3 h-3"/>}
+                                            {isAnalyzingImage ? "분석 중..." : "이 스타일 상세 분석하기"}
+                                        </button>
+                                    )}
+                                </div>
+
+                                {isAnalyzingImage ? (
+                                    <div className="flex flex-col items-center justify-center h-40 space-y-3 opacity-70">
+                                        <RefreshCw className="w-8 h-8 text-purple-500 animate-spin" />
+                                        <p className="text-sm text-purple-700 font-medium">AI가 새로운 스타일을 분석하고 있습니다...</p>
+                                    </div>
+                                ) : (
+                                    <div className="prose prose-purple max-w-none animate-in fade-in duration-300">
+                                        <p className="text-gray-800 leading-relaxed text-base whitespace-pre-wrap font-medium">
+                                            {currentText}
+                                        </p>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* [복원] 액션 버튼 영역: 챗봇 스타일 가이드 */}
+                            <div className="space-y-4 animate-in slide-in-from-bottom-4 fade-in">
+                                <div className="bg-white border border-gray-200 rounded-tr-2xl rounded-br-2xl rounded-bl-2xl p-4 shadow-sm inline-block relative">
+                                    <p className="text-gray-800 font-medium">
+                                        분석된 스타일과 유사한 상품을 찾아드릴까요?
+                                    </p>
+                                    <div className="absolute top-0 -left-2 w-4 h-4 bg-white border-l border-b border-gray-200 transform rotate-45"></div>
+                                </div>
+                                
+                                <div className="flex flex-wrap gap-3">
+                                    <button 
+                                        onClick={handleShowProducts}
+                                        className="px-6 py-3 bg-indigo-600 text-white rounded-full font-bold hover:bg-indigo-700 transition-all flex items-center gap-2 shadow-md hover:shadow-lg active:scale-95"
+                                    >
+                                        <Check className="w-5 h-5" /> 네, 전체 코디 보여줘
+                                    </button>
+                                    {/* [복원] 기존 UI에 있던 필터 버튼들 (기능은 추후 구현) */}
+                                    <button className="px-5 py-3 bg-white border border-gray-200 text-gray-600 rounded-full font-medium hover:bg-gray-50 hover:border-gray-300 transition-all">
+                                        상의만
+                                    </button>
+                                    <button className="px-5 py-3 bg-white border border-gray-200 text-gray-600 rounded-full font-medium hover:bg-gray-50 hover:border-gray-300 transition-all">
+                                        하의만
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
-            </div>
+            )}
+
+            {/* [2단계] 상품 리스트 (스크롤 이동 대상) */}
+            {!isLoading && showProducts && results.length > 0 && (
+                <div ref={productSectionRef} className="animate-in slide-in-from-bottom-10 duration-700 fade-in space-y-8 pt-8 border-t border-gray-100">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                            <ShoppingBag className="w-6 h-6 text-gray-700" />
+                            <h2 className="text-2xl font-bold text-gray-900">추천 상품 ({results.length})</h2>
+                        </div>
+                        <button onClick={handleScrollTop} className="text-gray-500 hover:text-purple-600 flex items-center gap-1 text-sm font-medium transition-colors">
+                            <ArrowUp className="w-4 h-4" /> 분석 다시 보기
+                        </button>
+                      </div>
+
+                      <div className="bg-gray-50 rounded-3xl p-8 border border-gray-100">
+                        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-6">
+                            {results.map((product) => (
+                                <ProductCard 
+                                    key={`${product.id}-${timestamp}`} 
+                                    product={{
+                                        ...product,
+                                        image_url: getBustedImage(product.image_url)
+                                    }} 
+                                /> 
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            )}
+            
+            {/* 결과 없음 */}
+            {!isLoading && showProducts && results.length === 0 && (
+                <div className="text-center py-32 text-gray-500 animate-in fade-in flex flex-col items-center">
+                    <AlertCircle className="w-16 h-16 text-gray-300 mb-4" />
+                    <p className="text-xl mb-4 font-medium text-gray-600">
+                        {aiAnalysis ? "분석한 스타일과 일치하는 상품 재고가 없습니다." : "검색 결과가 없습니다."}
+                    </p>
+                    <button onClick={() => setQuery('')} className="text-purple-600 font-medium hover:underline bg-purple-50 px-6 py-2 rounded-full">
+                        다른 키워드로 검색해보세요
+                    </button>
+                </div>
+            )}
         </div>
     );
 }

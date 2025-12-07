@@ -4,14 +4,16 @@ import re
 import base64
 from fastapi import FastAPI, HTTPException, APIRouter, UploadFile, File
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
 
 from src.core.model_engine import model_engine
 from src.core.prompts import VISION_ANALYSIS_PROMPT
+# [NEW] RAG Orchestrator 임포트
+from src.services.rag_orchestrator import rag_orchestrator
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ai-service")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -29,6 +31,10 @@ api_router = APIRouter(prefix="/api/v1")
 # --- DTO ---
 class EmbedRequest(BaseModel):
     text: str
+
+class AnalyzeRequest(BaseModel):
+    image_b64: str
+    query: str   
 
 class EmbedResponse(BaseModel):
     vector: List[float]
@@ -48,24 +54,17 @@ class InternalSearchRequest(BaseModel):
     query: str
     image_b64: Optional[str] = None
 
-class SearchProcessResponse(BaseModel):
-    vector: List[float]
-    reason: str
-
-# --- Helper Methods ---
+# --- Helper Methods (기존 코드 유지) ---
 
 def _fix_encoding(text: str) -> str:
     """
     [핵심] 깨진 한글(Mojibake) 및 유니코드 이스케이프 완벽 복구
-    Case 1: "í¬ë¦¬..." (UTF-8 bytes read as Latin-1) -> "크리..."
-    Case 2: "\ud558..." (Unicode Escape) -> "하..."
     """
     if not text:
         return ""
 
     # 1. Mojibake 복구 시도 (Latin-1 -> UTF-8)
     try:
-        # 깨진 문자열을 다시 바이트로 돌리고(latin1), UTF-8로 다시 읽음
         fixed = text.encode('latin1').decode('utf-8')
         return fixed
     except Exception:
@@ -85,10 +84,10 @@ def _extract_from_text(text: str, key_patterns: List[str], default: str = "") ->
         match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
             clean_val = match.group(1).strip().strip('",').strip()
-            return _fix_encoding(clean_val) # 추출한 값도 인코딩 보정
+            return _fix_encoding(clean_val)
     return default
 
-# --- Endpoints ---
+# --- Endpoints (기존 기능 유지) ---
 
 @api_router.post("/embed-text", response_model=EmbedResponse)
 async def embed_text(request: EmbedRequest):
@@ -110,19 +109,17 @@ async def analyze_image(file: UploadFile = File(...)):
         logger.info(f"👁️ Analyzing image: {filename}...")
         generated_text = model_engine.generate_with_image(prompt, image_b64)
         
-        # [Critical] 1차 인코딩 보정 (전체 텍스트 복구)
+        # [Critical] 1차 인코딩 보정
         generated_text = _fix_encoding(generated_text)
         logger.info(f"🤖 Raw AI Response: {generated_text}")
 
-        # [Safety Check]
         if "cannot assist" in generated_text or "I cannot" in generated_text:
             raise ValueError("AI Safety Filter Triggered")
 
-        # [Parsing Logic]
         product_data = {}
         parsing_success = False
 
-        # 전략 1: JSON 파싱
+        # JSON 파싱 시도
         try:
             json_match = re.search(r"\{[\s\S]*\}", generated_text)
             if json_match:
@@ -136,42 +133,20 @@ async def analyze_image(file: UploadFile = File(...)):
         except Exception as e:
             logger.warning(f"⚠️ JSON Parsing failed: {e}. Attempting Fallback Regex...")
 
-        # 전략 2: Fallback Parser
+        # Fallback Parser
         if not parsing_success:
             logger.info("🔧 Running Fallback Parser...")
-            
-            product_data["name"] = _extract_from_text(
-                generated_text, 
-                [r'"?name"?\s*:\s*"([^"]+)"', r'"?이름"?\s*:\s*"([^"]+)"', r'Name:\s*(.+)']
-            )
-            product_data["category"] = _extract_from_text(
-                generated_text, 
-                [r'"?category"?\s*:\s*"([^"]+)"', r'"?카테고리"?\s*:\s*"([^"]+)"', r'Category:\s*(.+)'
-                ], "Uncategorized"
-            )
-            product_data["gender"] = _extract_from_text(
-                generated_text,
-                [r'"?gender"?\s*:\s*"([^"]+)"', r'"?성별"?\s*:\s*"([^"]+)"', r'Gender:\s*(.+)'],
-                "Unisex"
-            )
-            product_data["description"] = _extract_from_text(
-                generated_text,
-                [r'"?description"?\s*:\s*"([^"]+)"', r'"?설명"?\s*:\s*"([^"]+)"', r'Description:\s*(.+)'],
-                "AI 상세 분석 내용입니다."
-            )
-            
-            price_str = _extract_from_text(
-                generated_text,
-                [r'"?price"?\s*:\s*([\d,]+)', r'"?가격"?\s*:\s*([\d,]+)', r'Price:\s*([\d,]+)'],
-                "0"
-            )
+            product_data["name"] = _extract_from_text(generated_text, [r'"?name"?\s*:\s*"([^"]+)"', r'"?이름"?\s*:\s*"([^"]+)"', r'Name:\s*(.+)'])
+            product_data["category"] = _extract_from_text(generated_text, [r'"?category"?\s*:\s*"([^"]+)"', r'"?카테고리"?\s*:\s*"([^"]+)"', r'Category:\s*(.+)'], "Uncategorized")
+            product_data["gender"] = _extract_from_text(generated_text, [r'"?gender"?\s*:\s*"([^"]+)"', r'"?성별"?\s*:\s*"([^"]+)"', r'Gender:\s*(.+)'], "Unisex")
+            product_data["description"] = _extract_from_text(generated_text, [r'"?description"?\s*:\s*"([^"]+)"', r'"?설명"?\s*:\s*"([^"]+)"', r'Description:\s*(.+)'], "AI 상세 분석 내용입니다.")
+            price_str = _extract_from_text(generated_text, [r'"?price"?\s*:\s*([\d,]+)', r'"?가격"?\s*:\s*([\d,]+)', r'Price:\s*([\d,]+)'], "0")
             try:
                 product_data["price"] = int(re.sub(r"[^0-9]", "", price_str))
             except:
                 product_data["price"] = 0
 
-        # [Normalization & 2차 인코딩 보정]
-        # JSON으로 파싱되었더라도 값 내부가 깨져있을 수 있으므로 한번 더 체크
+        # 데이터 정규화 및 벡터 생성
         final_name = _fix_encoding(product_data.get("name"))
         if not final_name or "상품명" in final_name or "JSON" in final_name:
              final_name = f"AI 추천 상품 ({filename.split('.')[0]})"
@@ -196,7 +171,6 @@ async def analyze_image(file: UploadFile = File(...)):
         except:
             price = 0
 
-        # 벡터 생성
         meta_text = f"[{final_gender}] {final_name} {final_cat} {final_desc}"
         vector = model_engine.generate_embedding(meta_text)
 
@@ -231,20 +205,57 @@ async def llm_generate(body: Dict[str, str]):
         return {"answer": answer}
     except:
         return {"answer": "죄송합니다. AI 응답을 생성할 수 없습니다."}
+    
+@app.post("/api/v1/analyze-image")
+async def analyze_image_endpoint(req: AnalyzeRequest):
+    """특정 이미지에 대한 상세 분석 요청"""
+    result = await rag_orchestrator.analyze_specific_image(req.image_b64, req.query)
+    return {"analysis": result}    
+
+
+# -------------------------------------------------------------
+# 🔍 [수정됨] RAG Orchestrator 연결 (검색 로직 고도화)
+# -------------------------------------------------------------
 
 @api_router.post("/determine-path")
 async def determine_path(request: PathRequest):
-    return {"path": "INTERNAL"}
+    """
+    사용자 쿼리를 분석하여 검색 경로(INTERNAL vs EXTERNAL)를 결정합니다.
+    [Updated] rag_orchestrator 호출
+    """
+    logger.info(f"🤔 Determining path for query: {request.query}")
+    try:
+        decision = await rag_orchestrator.determine_search_path(request.query)
+        logger.info(f"👉 Decision: {decision}")
+        return {"path": decision}
+    except Exception as e:
+        logger.error(f"Determine path error: {e}")
+        return {"path": "INTERNAL"}
 
-@api_router.post("/process-internal", response_model=SearchProcessResponse)
+@api_router.post("/process-internal")
 async def process_internal(request: InternalSearchRequest):
-    query = request.query
-    vector = model_engine.generate_embedding(query)
-    return {"vector": vector, "reason": f"'{query}' 검색 결과입니다."}
+    """
+    내부 검색 로직 실행
+    [Updated] rag_orchestrator 호출 (Dual Vector 생성)
+    """
+    logger.info(f"🏢 Processing Internal (Orchestrator): {request.query}")
+    return await rag_orchestrator.process_internal_search(request.query)
 
-@api_router.post("/process-external", response_model=SearchProcessResponse)
+@api_router.post("/process-external")
 async def process_external(request: InternalSearchRequest):
-    return await process_internal(request)
+    """
+    외부(Google+RAG) 검색 로직 실행
+    [Updated] rag_orchestrator 호출 (Google Search + Vision RAG)
+    """
+    logger.info(f"🌍 Processing External (Orchestrator): {request.query}")
+    try:
+        # 오케스트레이터가 Google Search -> Image Download -> CLIP/BERT Embedding까지 수행
+        result = await rag_orchestrator.process_external_rag(request.query)
+        return result
+    except Exception as e:
+        logger.error(f"External processing failed: {e}")
+        # 실패 시 내부 검색으로 Fallback
+        return await rag_orchestrator.process_internal_search(request.query)
 
 app.include_router(api_router)
 

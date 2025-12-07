@@ -1,117 +1,201 @@
 import os
 import logging
-import json
-from typing import List, Optional
+import base64
+import io
+import threading
+from typing import List, Optional, Dict, Union
+from PIL import Image
 
+# [AI Core]
+import torch
+from sentence_transformers import SentenceTransformer, util 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ibm import ChatWatsonx
 from langchain_core.messages import HumanMessage
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+# [상수 정의]
+BERT_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+CLIP_MODEL_NAME = "sentence-transformers/clip-ViT-B-32-multilingual-v1"
+CLIP_VISION_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"
 VISION_MODEL_ID = "meta-llama/llama-3-2-11b-vision-instruct" 
 
 class ModelEngine:
+    """
+    4-Model Hybrid Engine Singleton Class
+    - Watsonx (VLM): Image Analysis (Writer)
+    - BERT: Text Embedding (Retriever)
+    - CLIP Text: Query to Vector (Scorer-Criteria)
+    - CLIP Vision: Image to Vector (Scorer-Candidate)
+    """
     _instance: Optional['ModelEngine'] = None
+    _lock = threading.Lock() # Thread-safe initialization
     
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(ModelEngine, cls).__new__(cls)
+        return cls._instance
+
     def __init__(self):
+        # 이미 초기화되었다면 건너뜀 (Singleton 보장)
+        if hasattr(self, 'is_initialized') and self.is_initialized:
+            return
+            
         self.vision_model: Optional[ChatWatsonx] = None
         self.text_model: Optional[ChatWatsonx] = None
-        self.embedding_model: Optional[HuggingFaceEmbeddings] = None
+        self.bert_model: Optional[HuggingFaceEmbeddings] = None
+        self.clip_text_model: Optional[SentenceTransformer] = None
+        self.clip_vision_model: Optional[SentenceTransformer] = None
+        
         self.project_id = os.getenv("WATSONX_PROJECT_ID")
+        self.device = os.getenv("EMBEDDING_DEVICE", "cpu")
         self.is_initialized = False
 
     def initialize(self):
-        logger.info(f"🚀 Initializing Model Engine (Multilingual)...")
+        """Lazy Loading Pattern: 첫 요청 시 모델 로드"""
+        if self.is_initialized: return
         
+        with self._lock:
+            if self.is_initialized: return
+            logger.info(f"🚀 Initializing Hybrid Model Engine on [{self.device}]...")
+            
+            # 1. Watsonx (API 기반이라 가벼움)
+            self._init_watsonx()
+            
+            # 2. Local Models (메모리 사용량 주의)
+            try:
+                logger.info("loading BERT...")
+                self.bert_model = HuggingFaceEmbeddings(
+                    model_name=BERT_MODEL_NAME,
+                    model_kwargs={'device': self.device},
+                    encode_kwargs={'normalize_embeddings': True}
+                )
+            except Exception as e: logger.error(f"❌ BERT Failed: {e}")
+
+            try:
+                logger.info("loading CLIP Text...")
+                self.clip_text_model = SentenceTransformer(CLIP_MODEL_NAME, device=self.device)
+            except Exception as e: logger.error(f"❌ CLIP Text Failed: {e}")
+
+            try:
+                logger.info("loading CLIP Vision...")
+                self.clip_vision_model = SentenceTransformer(CLIP_VISION_MODEL_NAME, device=self.device)
+            except Exception as e: logger.error(f"❌ CLIP Vision Failed: {e}")
+
+            self.is_initialized = True
+            logger.info("✅ All Models Initialized Successfully.")
+
+    def _init_watsonx(self):
         try:
             api_key = os.getenv("WATSONX_API_KEY")
             url = os.getenv("WATSONX_URL", "https://us-south.ml.cloud.ibm.com")
             
             if api_key and self.project_id:
-                # [수정됨] Vision/Chat 모델 파라미터 최적화
+                # [분석용] 정확한 묘사를 위해 greedy decoding 사용
                 self.vision_model = ChatWatsonx(
-                    model_id=VISION_MODEL_ID,
-                    url=url,
-                    apikey=api_key,
-                    project_id=self.project_id,
+                    model_id=VISION_MODEL_ID, url=url, apikey=api_key, project_id=self.project_id,
                     params={
-                        # [핵심] greedy -> sample 변경 (한국어 깨짐 방지)
-                        "decoding_method": "sample", 
-                        "max_new_tokens": 900,
+                        "decoding_method": "greedy", 
+                        "temperature": 0.0,
+                        "max_new_tokens": 500,
                         "min_new_tokens": 10,
-                        "temperature": 0.7,       
-                        "top_p": 0.9,             
-                        "top_k": 50,
-                        "stop_sequences": ["}"]   
+                        "repetition_penalty": 1.2
                     }
                 )
-                self.text_model = self.vision_model
-                logger.info(f"✅ Watsonx Vision Model Loaded: {VISION_MODEL_ID}")
+                # [창작용] 텍스트 생성은 약간의 창의성 허용
+                self.text_model = ChatWatsonx(
+                     model_id=VISION_MODEL_ID, url=url, apikey=api_key, project_id=self.project_id,
+                     params={
+                        "decoding_method": "sample",
+                        "temperature": 0.3,
+                        "max_new_tokens": 600,
+                     }
+                )
+                logger.info(f"✅ Watsonx Connected.")
             else:
-                logger.warning("⚠️ Watsonx credentials missing. AI features disabled.")
+                logger.warning("⚠️ Watsonx credentials missing.")
+        except Exception as e: logger.error(f"❌ Watsonx Init Failed: {e}")
 
-        except Exception as e:
-            logger.error(f"❌ Watsonx Init Failed: {e}")
+    # ----------------------------------------------------------------
+    # Core Logic Methods
+    # ----------------------------------------------------------------
 
+    def calculate_similarity(self, text: str, image: Image.Image) -> float:
+        """Reranking Logic: CLIP Score Calculation"""
+        if not self.clip_text_model or not self.clip_vision_model:
+            self.initialize()
         try:
-            logger.info(f"📥 Loading Embedding Model: {EMBEDDING_MODEL_NAME}...")
-            self.embedding_model = HuggingFaceEmbeddings(
-                model_name=EMBEDDING_MODEL_NAME,
-                model_kwargs={'device': os.getenv("EMBEDDING_DEVICE", "cpu")},
-                encode_kwargs={'normalize_embeddings': True}
-            )
-            logger.info("✅ Embedding Model Loaded (Korean Supported).")
-            self.is_initialized = True
+            # 텍스트 임베딩 (캐싱 가능하나, 쿼리가 매번 다르므로 실시간 수행)
+            text_emb = self.clip_text_model.encode(text, convert_to_tensor=True)
+            # 이미지 임베딩
+            img_emb = self.clip_vision_model.encode(image, convert_to_tensor=True)
+            
+            # 코사인 유사도 계산
+            score = util.cos_sim(text_emb, img_emb).item()
+            return score
         except Exception as e:
-            logger.error(f"❌ Embedding Model Failed: {e}")
+            logger.error(f"Similarity check failed: {e}")
+            return 0.0
 
-    def generate_embedding(self, text: str) -> List[float]:
-        if not self.embedding_model:
-            self.initialize()
-        if self.embedding_model:
-            return self.embedding_model.embed_query(text)
-        return [0.0] * 768
+    def generate_dual_embedding(self, text: str) -> Dict[str, List[float]]:
+        """BERT(검색용) + CLIP(시각적 매칭용) 동시 생성"""
+        if not self.bert_model or not self.clip_text_model: self.initialize()
+        
+        result = {}
+        # BERT
+        if self.bert_model: 
+            result["bert"] = self.bert_model.embed_query(text)
+        else: 
+            result["bert"] = [0.0] * 768
+        
+        # CLIP Text
+        if self.clip_text_model:
+            clip_emb = self.clip_text_model.encode(text)
+            result["clip"] = clip_emb.tolist() if hasattr(clip_emb, "tolist") else clip_emb
+        else: 
+            result["clip"] = [0.0] * 512
+            
+        return result
 
-    def generate_text(self, prompt: str) -> str:
-        if not self.text_model:
-            self.initialize()
-        if self.text_model:
-            try:
-                response = self.text_model.invoke(prompt)
-                return response.content
-            except Exception as e:
-                logger.error(f"Text Gen Error: {e}")
-        return "AI Service Unavailable"
+    def generate_image_embedding(self, image_data: Union[str, Image.Image]) -> Dict[str, List[float]]:
+        """이미지 -> CLIP Vector 변환 (DB 저장 및 검색용)"""
+        if not self.clip_vision_model: self.initialize()
+        try:
+            pil_image = image_data
+            if isinstance(image_data, str):
+                # Base64 처리
+                if "base64," in image_data: image_data = image_data.split("base64,")[1]
+                pil_image = Image.open(io.BytesIO(base64.b64decode(image_data)))
+            
+            vector = self.clip_vision_model.encode(pil_image)
+            return {"clip": vector.tolist() if hasattr(vector, "tolist") else vector}
+        except Exception as e:
+            logger.error(f"🖼️ Image Embedding Error: {e}")
+            return {"clip": [0.0] * 512}
 
     def generate_with_image(self, text_prompt: str, image_b64: str) -> str:
-        if not self.vision_model:
-            self.initialize()
-        if not self.vision_model:
-            raise RuntimeError("AI Model not initialized")
-
+        """VLM Inference"""
+        if not self.vision_model: self.initialize()
         try:
-            message = HumanMessage(
-                content=[
-                    {"type": "text", "text": text_prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                    },
-                ]
-            )
-            response = self.vision_model.invoke([message])
-            
-            content = response.content
-            # JSON 닫는 괄호 안전장치
-            if "{" in content and "}" not in content:
-                content += "}"
-            return content
-            
+            message = HumanMessage(content=[
+                {"type": "text", "text": text_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+            ])
+            return self.vision_model.invoke([message]).content
         except Exception as e:
-            logger.error(f"👁️ Vision Analysis Error: {e}")
-            raise e
+            logger.error(f"Vision Error: {e}")
+            return "이미지 분석에 실패했습니다."
+            
+    def generate_text(self, prompt: str) -> str:
+        if not self.text_model: self.initialize()
+        try:
+            return self.text_model.invoke(prompt).content
+        except Exception as e:
+            logger.error(f"Text Gen Error: {e}")
+            return ""
 
-# 싱글톤 인스턴스
+# 전역 인스턴스 생성
 model_engine = ModelEngine()

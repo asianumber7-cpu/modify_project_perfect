@@ -26,13 +26,11 @@ export interface ProductCreateForm {
 // --- RAG & AI ---
 export type RAGStatus = 'QUEUED' | 'PROCESSING' | 'SUCCESS' | 'FAILURE';
 
-// RAG 결과의 답변 및 추천 상품 목록
 export interface RAGResult {
     answer: string;
     products?: ProductResponse[]; 
 }
 
-// RAG 작업 상태 응답
 export interface RAGTaskResponse {
     task_id: string | null;
     status: RAGStatus;
@@ -47,4 +45,32 @@ export interface User {
     full_name?: string; 
     is_superuser: boolean;
     is_marketing_agreed: boolean; 
+}
+
+export interface Product {
+  id: number;
+  name: string;
+  description: string;
+  price: number;
+  image_url: string;
+  category: string;
+  gender?: string;
+  is_active: boolean;
+}
+
+// [수정] 백엔드 응답 구조 반영
+export interface CandidateImage {
+    image_base64: string;
+    score: number;
+}
+
+export interface AISearchResponse {
+  status: string;
+  strategy: string; 
+  ai_analysis?: {
+    summary: string;
+    reference_image?: string; 
+    candidates?: CandidateImage[]; // [NEW] 단순 문자열 배열 -> 객체 배열로 변경
+  };
+  products: Product[];
 }

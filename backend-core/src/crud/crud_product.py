@@ -1,15 +1,13 @@
 from typing import List, Optional, Any, Union, Dict
 from datetime import datetime
-from sqlalchemy import select, update, func, text, case # [필수] case 추가
+from sqlalchemy import select, update, func, text, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.product import Product
 from src.schemas.product import ProductCreate, ProductUpdate 
 
 class CRUDProduct:
-    """상품 모델에 대한 비동기 CRUD 및 벡터 검색 연산을 담당하는 클래스"""
-
-    # --- [기존 CRUD 함수들 유지] ---
+    # 기본 CRUD 메서드 유지
     async def get(self, db: AsyncSession, product_id: int) -> Optional[Product]:
         stmt = select(Product).where(Product.id == product_id, Product.deleted_at.is_(None))
         result = await db.execute(stmt)
@@ -46,68 +44,91 @@ class CRUDProduct:
         return await self.get(db, product_id)
 
     # -------------------------------------------------------
-    # 🔍 [UPGRADE] 벡터 검색 + 성별 우선 정렬 로직 적용
+    # 🔍 [UPGRADE] Hybrid Search (BERT + CLIP)
     # -------------------------------------------------------
-    async def search_by_vector(
+    async def search_hybrid(
         self, 
         db: AsyncSession, 
-        query_vector: List[float], 
+        bert_vector: Optional[List[float]] = None,
+        clip_vector: Optional[List[float]] = None,
         limit: int = 10,
+        filter_gender: Optional[str] = None,
         min_price: Optional[int] = None,
-        max_price: Optional[int] = None,
-        exclude_id: Optional[List[int]] = None,
-        exclude_category: Optional[List[str]] = None,
-        filter_gender: Optional[str] = None,  
-        threshold: float = 1.2 
+        max_price: Optional[int] = None
     ) -> List[Product]:
         """
-        벡터 유사도 기반 상품 검색 (성별 일치 우선 정렬 적용)
+        Hybrid Search: CLIP(0.7) + BERT(0.3) 가중치 적용
         """
-        # 1. 거리 계산식 (L2 Distance)
-        distance_col = Product.embedding.l2_distance(query_vector)
-        
-        # 2. 기본 쿼리 시작
         stmt = select(Product)
         
-        # 3. [핵심] 정렬 로직 개선 (성별 우선 -> 그 다음 벡터 거리)
-        if filter_gender:
-            # "요청한 성별과 정확히 일치하면 0등, 아니면(Unisex) 1등"으로 정렬
-            gender_priority = case(
-                (Product.gender == filter_gender, 0),
-                else_=1
-            )
-            stmt = stmt.order_by(gender_priority, distance_col)
+        # 1. 거리 계산 (Cosine Distance)
+        if bert_vector and clip_vector:
+            dist_bert = Product.embedding.cosine_distance(bert_vector)
+            dist_clip = Product.embedding_clip.cosine_distance(clip_vector)
+            
+            # [튜닝] 이미지 유사도(CLIP)
+            combined_dist = (dist_bert * 0.1) + (dist_clip * 0.9)
+            stmt = stmt.order_by(combined_dist)
+            
+            stmt = stmt.filter(Product.embedding.is_not(None))
+            stmt = stmt.filter(Product.embedding_clip.is_not(None))
+            
+        elif bert_vector:
+            dist = Product.embedding.cosine_distance(bert_vector)
+            stmt = stmt.order_by(dist).filter(Product.embedding.is_not(None))
+            
+        elif clip_vector:
+            dist = Product.embedding_clip.cosine_distance(clip_vector)
+            stmt = stmt.order_by(dist).filter(Product.embedding_clip.is_not(None))
+            
         else:
-            # 성별 조건 없으면 그냥 벡터 거리순
-            stmt = stmt.order_by(distance_col)
-        
-        # 4. 필터링 (Where 조건)
-        stmt = stmt.filter(Product.is_active == True)
-        stmt = stmt.filter(Product.deleted_at.is_(None))
-        stmt = stmt.filter(Product.embedding.is_not(None))
-        
-        # 성별 필터 (Male 요청 시 -> Male 또는 Unisex만 포함)
+            return await self.get_multi(db, limit=limit)
+
+        # 2. 성별 필터링
         if filter_gender:
             stmt = stmt.filter(
                 (Product.gender == filter_gender) | (Product.gender == 'Unisex')
             )
 
-        # 유사도 커트라인
-        stmt = stmt.filter(distance_col < threshold)
+        # 3. 기본 필터링
+        stmt = stmt.filter(Product.is_active == True)
+        stmt = stmt.filter(Product.deleted_at.is_(None))
 
-        # 추가 필터
         if min_price is not None: stmt = stmt.filter(Product.price >= min_price)
         if max_price is not None: stmt = stmt.filter(Product.price <= max_price)
-        if exclude_id and len(exclude_id) > 0: 
-            stmt = stmt.filter(Product.id.notin_(exclude_id))
-        if exclude_category and len(exclude_category) > 0: 
-            stmt = stmt.filter(Product.category.notin_(exclude_category))
 
-        # 개수 제한
         stmt = stmt.limit(limit)
         
         result = await db.execute(stmt)
         return result.scalars().all()
 
-# 싱글톤 객체 생성
+    # Legacy Support
+    async def search_by_vector(self, db: AsyncSession, query_vector: List[float], limit: int = 10, **kwargs):
+        return await self.search_hybrid(db, bert_vector=query_vector, limit=limit, **kwargs)
+    
+    # Keyword Fallback
+    async def search_keyword(
+        self, 
+        db: AsyncSession, 
+        query: str, 
+        limit: int = 10, 
+        filter_gender: Optional[str] = None
+    ) -> List[Product]:
+        search_pattern = f"%{query}%"
+        stmt = select(Product).where(
+            Product.is_active == True,
+            Product.deleted_at.is_(None),
+            (
+                Product.name.ilike(search_pattern) | 
+                Product.description.ilike(search_pattern) | 
+                Product.category.ilike(search_pattern)
+            )
+        )
+        if filter_gender:
+            stmt = stmt.where((Product.gender == filter_gender) | (Product.gender == 'Unisex'))
+            
+        stmt = stmt.order_by(Product.created_at.desc()).limit(limit)
+        result = await db.execute(stmt)
+        return result.scalars().all()
+
 crud_product = CRUDProduct()

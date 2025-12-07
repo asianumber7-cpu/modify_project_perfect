@@ -95,19 +95,19 @@ services:
       dockerfile: Dockerfile
     container_name: modify-ai-api
     restart: always
-    # AI 서비스 API 서버 실행
     command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
-      - "8005:8000" # 호스트 8005 -> 컨테이너 8000 (테스트용)
+      - "8005:8000"
+    # [수정됨] 루트 파일이 아니라, ai-service 폴더 안의 설정 파일을 읽도록 변경
     env_file:
-      - .env.dev
-    # [FIX] Inotify 한도 초과 에러 방지를 위한 폴링 모드 강제 설정
+      - ./ai-service/.env.dev
     environment:
       - WATCHFILES_FORCE_POLLING=true
     volumes:
       - ./ai-service:/app 
       - model_cache:/app/models_cache
-      - ./.env.dev:/app/.env.dev
+      # [수정됨] 볼륨 마운트도 AI 폴더 내부 파일로 연결
+      - ./ai-service/.env.dev:/app/.env.dev
     networks:
       - modify-network
 
@@ -118,14 +118,15 @@ services:
       dockerfile: Dockerfile
     container_name: modify-ai-worker
     restart: always
-    # AI 전용 Celery 워커 실행
     command: celery -A src.worker.celery_app worker --loglevel=info --concurrency=2
+    # [수정됨] 루트 파일이 아니라, ai-service 폴더 안의 설정 파일을 읽도록 변경
     env_file:
-      - .env.dev
+      - ./ai-service/.env.dev
     volumes:
       - ./ai-service:/app 
       - model_cache:/app/models_cache
-      - ./.env.dev:/app/.env.dev
+      # [수정됨] 볼륨 마운트도 AI 폴더 내부 파일로 연결
+      - ./ai-service/.env.dev:/app/.env.dev
     depends_on:
       redis:
         condition: service_healthy

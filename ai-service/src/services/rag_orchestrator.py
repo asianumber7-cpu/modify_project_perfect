@@ -1,171 +1,213 @@
-import os
 import asyncio
-import base64
-from typing import List, Dict, Any, Optional
 import logging
 import aiohttp
+import base64
+import re
 from io import BytesIO
+from typing import List, Dict, Any, Optional
 from PIL import Image
-from googleapiclient.discovery import build # Google API Client (동기)
 
 from src.core.model_engine import model_engine
-from src.services.quota_monitor import quota_monitor # 쿼터 모니터 필요
-from src.core.config import settings # 설정 필요
+from src.services.quota_monitor import quota_monitor
+from src.services.google_search_client import GoogleSearchClient
 
 logger = logging.getLogger(__name__)
 
 class AIOrchestrator:
-    """
-    사용자 쿼리를 받아 검색 유형을 결정하고, 
-    Vision, RAG, Vector Embedding 파이프라인을 지휘하는 중앙 컨트롤러.
-    """
     def __init__(self):
         self.engine = model_engine
-        self.semaphore = asyncio.Semaphore(5) # 이미지 병렬 다운로드 제어
+        self.search_client = GoogleSearchClient()
+        self.semaphore = asyncio.Semaphore(5)
 
-    # -------------------------------------------------------------
-    # RAG: Google Search 및 이미지 처리 (새로 주신 코드 통합)
-    # -------------------------------------------------------------
-    def _google_image_search(self, query: str, num: int = 5) -> Dict[str, Any]:
-        """ Google Image Search API 호출 (동기) """
-        is_allowed, remaining = quota_monitor.check_and_increment()
-        
-        if not is_allowed:
-            logger.warning("⚠️ Google API Quota Exceeded!")
-            return {"error": "quota_exceeded", "items": []}
-            
-        try:
-            # Google API Build는 동기 함수입니다.
-            service = build("customsearch", "v1", developerKey=settings.GOOGLE_API_KEY)
-            res = service.cse().list(
-                q=query, 
-                cx=settings.GOOGLE_SEARCH_ENGINE_ID, 
-                searchType="image", 
-                num=num
-            ).execute()
-            return {"items": res.get("items", [])}
-        except Exception as e:
-            logger.error(f"❌ Google Search API Error: {e}")
-            return {"error": "api_error", "items": []}
-
-    async def _download_and_process_image(self, session: aiohttp.ClientSession, url: str):
-        """ 이미지 다운로드 및 PIL Image 객체 반환 (비동기, 병렬) """
+    async def _download_image(self, session: aiohttp.ClientSession, url: str) -> Optional[Image.Image]:
         async with self.semaphore:
             try:
-                # [Critical] 10초 타임아웃 설정
-                timeout = aiohttp.ClientTimeout(total=10)
-                async with session.get(url, timeout=timeout) as response:
+                timeout = aiohttp.ClientTimeout(total=4)
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://www.google.com/"
+                }
+                async with session.get(url, headers=headers, timeout=timeout) as response:
                     if response.status == 200:
                         data = await response.read()
-                        # NOTE: Image.open은 I/O 블로킹 작업이므로 Celery에서는 Process Pool에서 실행해야 안전함.
-                        # 여기서는 Celery Task가 아닌 FastAPI 비동기 환경에서 사용한다고 가정하고 진행.
                         image = Image.open(BytesIO(data)).convert("RGB")
+                        if image.width < 250 or image.height < 250: return None
                         return image
-            except Exception as e:
-                logger.warning(f"⚠️ Image download skipped ({url}): {str(e)}")
-                return None
-    
-    # -------------------------------------------------------------
-    # 핵심 비즈니스 로직 (LLM 기반 추론 및 경로 결정)
-    # -------------------------------------------------------------
+            except Exception: return None
+        return None
 
-    async def determine_search_path(self, query: str) -> str:
-        """
-        쿼리가 INTERNAL(색상/형태)인지 EXTERNAL(트렌드/RAG)인지 LLM에게 물어 결정합니다.
-        (로직은 이전 코드와 동일하게 유지)
-        """
-        internal_keywords = ["빨간색", "니트", "코트", "바지", "가격", "재질", "색상", "비슷한 가격", "비슷한 색상", "다른 브랜드"]
-        if any(kw in query for kw in internal_keywords):
-             return 'INTERNAL'
-
-        prompt = f"""
-        주어진 쿼리가 실시간/외부 트렌드(예: 연예인, 사건, 최신 기술)를 참조해야 하는 복잡한 검색이면 'EXTERNAL', 
-        단순히 DB 내 상품 속성(색상, 카테고리 등)으로 해결 가능하면 'INTERNAL'로만 답변하세요.
-        쿼리: "{query}"
-        """
-        
+    # [수정] 화질 개선 (85 -> 95)
+    def _image_to_base64(self, image: Image.Image) -> str:
         try:
-            decision_text = await self.engine.get_llm_response(prompt)
-            if 'EXTERNAL' in decision_text.upper():
-                return 'EXTERNAL'
-            return 'INTERNAL'
-        except Exception as e:
-            logger.error(f"Path determination failed: {e}")
-            return 'INTERNAL'
+            buffered = BytesIO()
+            # [핵심] VLM이 디테일을 볼 수 있도록 고화질 유지
+            image.save(buffered, format="JPEG", quality=95)
+            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            return f"data:image/jpeg;base64,{img_str}"
+        except Exception: return ""
 
-    async def process_internal_search(self, query: str) -> Dict[str, Any]:
-        """
-        INTERNAL Path: 쿼리 벡터화 및 핵심 키워드 추출
-        """
-        core_prompt = f"'{query}'에서 상품 검색을 위한 가장 중요한 키워드와 스타일 속성(예: 오버핏, 캐주얼)을 5개 단어 이하로 추출하고 쉼표로 구분하시오."
-        core_text = await self.engine.get_llm_response(core_prompt)
+    def _optimize_query(self, user_query: str) -> str:
+        # (기존 코드 유지: 조사 제거 및 LLM 최적화)
+        prompt = f"""
+        Role: Search Query Optimizer.
+        Task: Convert natural language to short keywords.
+        Input: "{user_query}"
         
-        # 768차원 벡터 생성
-        vector = self.engine.generate_embedding(core_text)
-        
-        return {"vector": vector, "keyword": core_text}
+        Rules:
+        1. Remove Particles: Remove Korean particles like '가', '는', '을', '를'.
+        2. Remove Context: Remove "10분만에", "꼬신", "남자".
+        3. Output: "Celebrity Name" + "Style Keywords" (e.g. "Lee Hyori Y2K Fashion").
+        """
+        try:
+            optimized = self.engine.generate_text(prompt).strip()
+            if len(optimized) < 30 and len(optimized) > 2:
+                return optimized
+        except: pass
 
-    async def process_external_rag(self, query: str, image_b64: Optional[str] = None) -> Dict[str, Any]:
-        """
-        EXTERNAL Path: Google Search -> RAG/Vision 분석 -> 벡터 생성
-        """
-        # 1. Google Search를 통해 이미지/텍스트 컨텍스트 확보
-        search_res = self._google_image_search(query)
-        items = search_res.get("items", [])
+        words = user_query.split()
+        keywords = []
+        stop_words = ["추천해줘", "보여줘", "찾아줘", "알려줘", "어때", "사진", "이미지", "10분만에", "꼬셨던", "남자"]
         
-        # 2. 이미지 다운로드 및 PIL 객체 리스트 생성
+        for w in words:
+            clean_w = re.sub(r'(은|는|이|가|을|를|의|에|로)$', '', w)
+            if clean_w not in stop_words and len(clean_w) > 1:
+                keywords.append(clean_w)
+        
+        if not keywords: return user_query
+        return " ".join(keywords)
+
+    def _get_scoring_context(self, query: str) -> str:
+        if any(k in query for k in ["가방", "신발", "지갑"]): return "close up product shot"
+        return "full body fashion style"
+
+    def _normalize_score(self, raw_score: float) -> int:
+        if raw_score < 0.15: return 0
+        normalized = (raw_score - 0.15) * 450
+        return int(min(max(normalized, 60), 99))
+
+    async def process_external_rag(self, query: str) -> Dict[str, Any]:
+        logger.info(f"🌍 Processing EXTERNAL RAG: {query}")
+        allowed, _ = quota_monitor.check_and_increment()
+        if not allowed: return await self.process_internal_search(query)
+
+        optimized_query = self._optimize_query(query)
+        
+        search_results = await self.search_client.search_images(
+            optimized_query, num_results=15, start_index=1
+        )
+        
+        if not search_results: return await self.process_internal_search(query)
+
+        best_image = None
+        candidates_data = []
+
         async with aiohttp.ClientSession() as session:
-            tasks = [self._download_and_process_image(session, item['link']) for item in items]
-            images: List[Optional[Image.Image]] = await asyncio.gather(*tasks)
+            tasks = [self._download_image(session, item['link']) for item in search_results]
+            downloaded_images = await asyncio.gather(*tasks)
 
-        valid_images: List[Image.Image] = [img for img in images if img is not None]
-        
-        vision_analysis = ""
-        if image_b64 or valid_images:
-            # 3. Vision 분석 (Llama Vision 또는 YOLO/DINOv2)
-            # YOLO/DINOv2를 사용한 객체 탐지 및 스타일 분석 로직은 Celery Task로 분리해야 합니다.
-            # 여기서는 분석 요청만 보낸다고 가정합니다.
-            
-            # TODO: 여기에 Vision API 호출 로직 구현
-            vision_analysis = "Vision Model: 이미지에서 핵심 상품(예: 블랙 코트) 및 스타일이 분석되었습니다."
+            scored_candidates = []
+            clip_prompt = f"{optimized_query} {self._get_scoring_context(optimized_query)}"
 
-        # 4. RAG 컨텍스트 확보 및 LLM 요약
-        context = "\n".join([r.get('snippet', '') for r in items])
-        
-        rag_prompt = f"""
-        다음 컨텍스트(외부 검색 결과 및 시각 분석)를 바탕으로 사용자의 쿼리에 가장 적합한 상품 검색 키워드를 5개 이하로 추출하고, 그 결과를 바탕으로 사용자에게 제공할 짧은 추천 이유(1문장)를 작성하세요.
-        
-        [컨텍스트]
-        {context}
-        {vision_analysis}
-        
-        [출력 형식]
-        KEYWORD: 키워드1, 키워드2, 키워드3, ...
-        REASON: 추천 이유 문장
-        
-        사용자 쿼리: {query}
-        """
+            for i, img in enumerate(downloaded_images):
+                if img:
+                    base_score = self.engine.calculate_similarity(clip_prompt, img)
+                    ratio_bonus = 0.05 if img.height > img.width else 0.0
+                    final_score = base_score + ratio_bonus
 
-        rag_response = await self.engine.get_llm_response(rag_prompt)
-        
-        # 응답 파싱
-        keyword_line = next((line for line in rag_response.split('\n') if line.startswith('KEYWORD:')), '')
-        reason_line = next((line for line in rag_response.split('\n') if line.startswith('REASON:')), '')
-        
-        keywords = keyword_line.replace("KEYWORD:", "").strip()
-        reason = reason_line.replace("REASON:", "").strip()
-        
-        # 5. 최종 검색 키워드를 임베딩하여 벡터 생성
-        vector = self.engine.generate_embedding(keywords)
-        
-        # 검색 소스 정리
-        search_sources = [{"title": item.get('title'), "url": item.get('link')} for item in items]
+                    if final_score > 0.18:
+                        scored_candidates.append({
+                            "image": img,
+                            "url": search_results[i]['link'],
+                            "raw_score": final_score,
+                            "display_score": self._normalize_score(final_score)
+                        })
+
+            scored_candidates.sort(key=lambda x: x['raw_score'], reverse=True)
+            top_candidates = scored_candidates[:4]
+
+            if top_candidates:
+                best_candidate = top_candidates[0]
+                best_image = best_candidate['image']
+                
+                for cand in top_candidates:
+                    candidates_data.append({
+                        "image_base64": self._image_to_base64(cand['image']),
+                        "score": cand['display_score']
+                    })
+
+        if not best_image:
+            return await self.process_internal_search(query)
+
+        summary = await self._analyze_image_with_vlm(best_image, query)
+        final_data_uri = self._image_to_base64(best_image)
+
+        vectors = {
+            "bert": self.engine.generate_dual_embedding(summary)["bert"],
+            "clip": self.engine.generate_image_embedding(best_image)["clip"]
+        }
 
         return {
-            "vector": vector, 
-            "keyword": keywords,
-            "reason": reason,
-            "search_sources": search_sources
+            "vectors": vectors,
+            "search_path": "EXTERNAL",
+            "strategy": "visual_rag_vlm",
+            "ai_analysis": {
+                "summary": summary,
+                "reference_image": final_data_uri,
+                "candidates": candidates_data
+            },
+            "description": summary,
+            "ref_image": final_data_uri
         }
+
+    async def analyze_specific_image(self, image_b64: str, query: str) -> str:
+        try:
+            if "base64," in image_b64:
+                image_b64 = image_b64.split("base64,")[1]
+            return await self._analyze_image_with_vlm(image_b64, query)
+        except Exception:
+            return "이미지 분석에 실패했습니다."
+
+    # [핵심 수정] VLM 분석 프롬프트 강화 (Grounding)
+    async def _analyze_image_with_vlm(self, image_data: Any, query: str) -> str:
+        try:
+            if isinstance(image_data, Image.Image):
+                img_b64 = self._image_to_base64(image_data).split(",")[1]
+            else:
+                img_b64 = image_data
+
+            # [Grounding Prompt] "보이는 것만 묘사하라"는 강력한 제약 추가
+            vlm_prompt = f"""
+            당신은 정직한 패션 에디터입니다.
+            **오직 이미지에 시각적으로 보이는 것만** 설명하세요. 
+            이미지에 없는 내용(상상, 배경지식, 추측)은 절대 포함하지 마세요.
+            
+            사용자 질문: "{query}" (참고용일 뿐, 실제 이미지 내용이 우선입니다.)
+            
+            [분석 가이드]
+            1. **트렌드 무드**: 이미지에서 느껴지는 실제 분위기만 한 줄로 작성.
+            2. **스타일링 포인트**: 눈에 보이는 옷의 색상, 소재, 핏을 구체적으로 묘사 (예: "검은색 가죽 자켓", "파란색 데님 팬츠").
+            3. **추천 아이템**: 이 사진 속 인물이 착용한 아이템과 유사한 제품 추천.
+            
+            반드시 한국어로 작성하세요.
+            """
+            return self.engine.generate_with_image(vlm_prompt, img_b64)
+        except Exception:
+            return "분석 불가"
+
+    async def process_internal_search(self, query: str) -> Dict[str, Any]:
+        vectors = self.engine.generate_dual_embedding(query)
+        return {
+            "vectors": vectors,
+            "search_path": "INTERNAL",
+            "strategy": "internal_text",
+            "ai_analysis": None,
+            "description": f"'{query}' 내부 검색 결과",
+            "ref_image": None
+        }
+
+    async def determine_search_path(self, query: str) -> str:
+        external_triggers = ["스타일", "코디", "패션", "룩", "유행", "연예인", "공항", "입은", "추천"]
+        if any(t in query for t in external_triggers): return 'EXTERNAL'
+        return 'INTERNAL'
 
 rag_orchestrator = AIOrchestrator()
