@@ -105,8 +105,7 @@ async def refresh_token(
     except JWTError:
         raise HTTPException(status_code=401, detail="Could not validate credentials")
         
-    # 🚨 [CRITICAL FIX] 올바른 함수 호출: crud_user.get_user -> crud_user.get
-    # crud_user.py 파일에 정의된 함수명(get)과 일치해야 합니다.
+        # 사용자 조회
     user = await crud_user.get(db, user_id=int(user_id))
     
     if not user:

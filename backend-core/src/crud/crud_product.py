@@ -49,7 +49,7 @@ class CRUDProduct:
         return await self.get(db, product_id)
 
     # -------------------------------------------------------
-    # 🔍 [NEW] 스마트 하이브리드 검색 - 키워드 우선 + 벡터 보조
+    #  스마트 하이브리드 검색 - 키워드 우선 + 벡터 보조
     # -------------------------------------------------------
     async def search_smart_hybrid(
         self,
@@ -86,7 +86,7 @@ class CRUDProduct:
         seen_ids = set()
 
         # =====================================================
-        # 🥇 1단계: 키워드 정확 매칭 (최우선)
+        # 1단계: 키워드 정확 매칭 (최우선)
         # =====================================================
         if query and len(query.strip()) >= 2:
             # 핵심 키워드 추출 (조사 제거)
@@ -127,7 +127,7 @@ class CRUDProduct:
                             return final_results
 
         # =====================================================
-        # 🥈 2단계: 벡터 유사도 검색 (보완)
+        # 2단계: 벡터 유사도 검색 (보완)
         # =====================================================
         if len(final_results) < limit and bert_vector and len(bert_vector) == 768:
             remaining = limit - len(final_results)
@@ -149,7 +149,7 @@ class CRUDProduct:
                     seen_ids.add(product.id)
 
         # =====================================================
-        # 🥉 3단계: 최신 상품 Fallback
+        # 3단계: 최신 상품 Fallback
         # =====================================================
         if len(final_results) < limit:
             remaining = limit - len(final_results)
@@ -202,7 +202,7 @@ class CRUDProduct:
         return keywords
 
     # -------------------------------------------------------
-    # ✅ [NEW] CLIP 이미지 벡터 기반 검색 (시각적 유사도)
+    # CLIP 이미지 벡터 기반 검색 (시각적 유사도)
     # -------------------------------------------------------
     async def search_by_clip_vector(
         self, 
@@ -264,7 +264,7 @@ class CRUDProduct:
         return list(result.scalars().all())
 
     # -------------------------------------------------------
-    # 🔧 [UPDATED] 기존 하이브리드 검색 - exclude 파라미터 추가
+    # 기존 하이브리드 검색
     # -------------------------------------------------------
     async def search_hybrid(
         self, 
@@ -299,12 +299,12 @@ class CRUDProduct:
         if max_price is not None:
             base_conditions.append(Product.price <= max_price)
         
-        # ✅ 추가: 카테고리 제외
+        #  카테고리 제외
         if exclude_category:
             for cat in exclude_category:
                 base_conditions.append(Product.category != cat)
         
-        # ✅ 추가: ID 제외
+        # ID 제외
         if exclude_id:
             base_conditions.append(Product.id.notin_(exclude_id))
 
@@ -343,7 +343,7 @@ class CRUDProduct:
         return list(result.scalars().all())
 
     # -------------------------------------------------------
-    # 🔧 [UPDATED] 벡터 검색 - filter_gender 파라미터 추가
+    # 벡터 검색 
     # -------------------------------------------------------
     async def search_by_vector(
         self, 
@@ -354,7 +354,6 @@ class CRUDProduct:
         exclude_id: Optional[List[int]] = None,
         min_price: Optional[int] = None,
         max_price: Optional[int] = None,
-        # ✅ 추가: 성별 필터
         filter_gender: Optional[str] = None,
         **kwargs
     ) -> List[Product]:
@@ -383,7 +382,7 @@ class CRUDProduct:
         if max_price is not None:
             conditions.append(Product.price <= max_price)
         
-        # ✅ 추가: 성별 필터
+        # 성별 필터
         if filter_gender:
             conditions.append(
                 or_(

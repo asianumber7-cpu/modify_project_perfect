@@ -48,7 +48,6 @@ class Settings(BaseSettings):
     # AI & Vector DB
     EMBEDDING_DIMENSION: int = 768 # 벡터 차원 (768D)
     
-    # 🚨 [FIX] AI Service Connection URL 추가 (Docker Network Internal URL)
     # 기본값: http://ai-service-api:8000/api/v1 (docker-compose 서비스명 기준)
     AI_SERVICE_API_URL: str = Field(
         "http://ai-service-api:8000/api/v1", 

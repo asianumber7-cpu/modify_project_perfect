@@ -62,10 +62,10 @@ export const useAuthStore = create<AuthState>()(
         localStorage.removeItem('auth-storage');
       },
 
-      // ✨ 프로필 정보 업데이트 (기존 정보를 유지하면서 덮어쓰기)
+      // 프로필 정보 업데이트 (기존 정보를 유지하면서 덮어쓰기)
       setUser: (updatedUser) => {
         set((state) => ({ 
-          user: { ...state.user, ...updatedUser }, // 기존 정보 + 새 정보 병합
+          user: { ...state.user, ...updatedUser }, 
           isAdmin: updatedUser.is_superuser 
         }));
       },

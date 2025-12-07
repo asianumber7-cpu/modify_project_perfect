@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager
 
 from src.core.model_engine import model_engine
 from src.core.prompts import VISION_ANALYSIS_PROMPT
-# [NEW] RAG Orchestrator 임포트
 from src.services.rag_orchestrator import rag_orchestrator
 
 logging.basicConfig(level=logging.INFO)
@@ -54,7 +53,7 @@ class InternalSearchRequest(BaseModel):
     query: str
     image_b64: Optional[str] = None
 
-# ✅ NEW: CLIP 벡터 생성 요청
+# CLIP 벡터 생성 요청
 class ClipVectorRequest(BaseModel):
     image_b64: str
 
@@ -62,7 +61,7 @@ class ClipVectorResponse(BaseModel):
     vector: List[float]
     dimension: int
 
-# ✅ NEW: 이미지 기반 상품 검색 요청
+# 이미지 기반 상품 검색 요청
 class ImageSearchRequest(BaseModel):
     image_b64: str
     limit: int = 12
@@ -227,7 +226,7 @@ async def analyze_image_endpoint(req: AnalyzeRequest):
 
 
 # -------------------------------------------------------------
-# ✅ [NEW] CLIP 이미지 벡터 생성 엔드포인트
+# CLIP 이미지 벡터 생성 엔드포인트
 # -------------------------------------------------------------
 
 @api_router.post("/generate-clip-vector", response_model=ClipVectorResponse)
@@ -299,7 +298,7 @@ async def search_by_image(request: ImageSearchRequest):
 
 
 # -------------------------------------------------------------
-# 🔍 RAG Orchestrator 연결 (검색 로직 고도화)
+#  RAG Orchestrator 연결 (검색 로직 고도화)
 # -------------------------------------------------------------
 
 @api_router.post("/determine-path")

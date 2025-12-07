@@ -179,7 +179,7 @@ export default function Search() {
         handleSearch(query, imageFile, false);
     };
 
-    // ✅ [수정] 후보 이미지 선택 시 상품 재검색
+    // 후보 이미지 선택 시 상품 재검색
     const handleSelectCandidateImage = async (imageBase64: string) => {
         setSelectedImage(imageBase64);
         
@@ -189,7 +189,7 @@ export default function Search() {
         }
     };
 
-    // ✅ [NEW] 이미지 기반 상품 검색
+    // 이미지 기반 상품 검색
     const searchProductsByImage = async (imageBase64: string) => {
         setIsSearchingProducts(true);
         
@@ -229,7 +229,7 @@ export default function Search() {
         }
     };
 
-    // ✅ [수정] 상품 보기 핸들러 - 선택된 이미지로 검색
+    // 상품 보기 핸들러 - 선택된 이미지로 검색
     const handleShowProducts = async () => {
         setShowProducts(true);
         

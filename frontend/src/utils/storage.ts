@@ -2,7 +2,7 @@
 
 import CryptoJS from 'crypto-js';
 
-// 🚨 VITE 환경 변수를 로드합니다. (Docker 및 CI/CD 환경에서 이 변수가 반드시 설정되어야 합니다.)
+// VITE 환경 변수를 로드합니다. (Docker 및 CI/CD 환경에서 이 변수가 반드시 설정되어야 합니다.)
 const SECRET_KEY = import.meta.env.VITE_ENCRYPTION_KEY || 'development_secret_key_DO_NOT_USE';
 
 /**

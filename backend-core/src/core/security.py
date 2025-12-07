@@ -14,8 +14,7 @@ from src.schemas.user import UserCreate
 # --------------------------------------------------------------------------
 # 1. 비밀번호 해싱 및 검증
 # --------------------------------------------------------------------------
-# 🚨 FIX: 기존 데이터 호환성 및 Docker 환경 안정성을 위해 PBKDF2로 복구
-# bcrypt는 C 라이브러리 의존성(HW/OS) 문제 및 기존 DB 해시 불일치 원인이 됨
+
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -67,7 +66,7 @@ async def setup_superuser(db: AsyncSession) -> None:
     """
     환경 변수를 기반으로 초기 관리자 계정을 생성하거나 확인합니다.
     """
-    # ✅ 순환 참조 방지를 위한 Lazy Import 유지
+    # 순환 참조 방지를 위한 Lazy Import 유지
     from src.crud import crud_user 
 
     # 1. 관리자 계정 존재 여부 확인

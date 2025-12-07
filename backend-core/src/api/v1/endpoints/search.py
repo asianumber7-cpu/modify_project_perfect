@@ -297,11 +297,11 @@ async def ai_search(
                 logger.error(f"❌ AI Service failed after {max_retries} retries")
             await asyncio.sleep(1)
 
-    # 4. 🌟 검색 실행 - 경로에 따라 다른 전략
+    # 4. 검색 실행 - 경로에 따라 다른 전략
     results = []
     
     try:
-        # ✅ 핵심 수정: EXTERNAL 경로 (연예인 패션 등) → CLIP 이미지 벡터로 검색
+        # 핵심 수정: EXTERNAL 경로 (연예인 패션 등) → CLIP 이미지 벡터로 검색
         if search_path == "EXTERNAL" and clip_vec and len(clip_vec) == 512:
             logger.info(f"🖼️ Using CLIP image vector search (512-dim)")
             

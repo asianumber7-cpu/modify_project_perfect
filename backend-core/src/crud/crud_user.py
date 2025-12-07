@@ -6,7 +6,7 @@ from src.schemas.user import UserCreate
 from src.core.security import get_password_hash, verify_password
 
 # --------------------------------------------------------------------------
-# [NEW] ID로 유저 조회 (필수 기능 추가)
+# ID로 유저 조회
 # --------------------------------------------------------------------------
 async def get(db: AsyncSession, user_id: int) -> Optional[User]:
     """ID 기반 유저 조회"""

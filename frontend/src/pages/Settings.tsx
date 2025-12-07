@@ -9,14 +9,14 @@ import { useUIStore } from '@/store/uiStore';
 import client from '@/api/client';
 import PasswordModal from '@/components/common/modals/PasswordModal';
 import TwoFactorModal from '@/components/common/modals/TwoFactorModal';
-import { User } from '@/types'; // ✨ 수정된 타입 임포트
+import { User } from '@/types'; 
 
 export default function Settings() {
   const navigate = useNavigate();
   const { isDarkMode, toggleDarkMode } = useUIStore();
   
   // UI 상태
-  const [notifications, setNotifications] = useState(true); // (API 미구현 상태라 로컬만)
+  const [notifications, setNotifications] = useState(true); 
   
   // 사용자 데이터 상태
   const [user, setUser] = useState<User | null>(null);
@@ -118,7 +118,7 @@ export default function Settings() {
                 <p className="text-sm font-bold text-gray-900 dark:text-white">마케팅 정보 수신</p>
                 <p className="text-xs text-gray-500 dark:text-gray-400">이벤트 및 혜택 정보를 받습니다.</p>
               </div>
-              {/* ✨ 실제 API와 연동된 버튼 */}
+              {/* 실제 API와 연동된 버튼 */}
               <button 
                 onClick={toggleMarketing}
                 className={`w-11 h-6 rounded-full transition-colors duration-200 ease-in-out relative ${user?.is_marketing_agreed ? 'bg-indigo-600' : 'bg-gray-200 dark:bg-gray-600'}`}

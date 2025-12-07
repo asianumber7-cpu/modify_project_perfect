@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from src.api.v1.endpoints import auth, admin, users, products, search
 
-# 👇 이 변수(api_router)를 main.py에서 가져가려고 하는 겁니다.
+# 이 변수(api_router)를 main.py에서 가져가려고 하는 겁니다.
 api_router = APIRouter()
 
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])

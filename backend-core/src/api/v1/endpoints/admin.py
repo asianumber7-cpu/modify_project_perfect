@@ -7,7 +7,7 @@ from src.api.deps import get_db, get_current_user
 from src.schemas.admin import DashboardStatsResponse, SalesData
 from src.models.user import User
 
-# 🚨 수정: prefix 제거 (main.py에서 이미 처리됨)
+
 router = APIRouter()
 
 def check_superuser(current_user: User = Depends(get_current_user)) -> User:
@@ -18,8 +18,7 @@ def check_superuser(current_user: User = Depends(get_current_user)) -> User:
         )
     return current_user
 
-# 🚨 수정: 경로를 간단하게 "/dashboard"로 변경
-# 실제 URL: /api/v1/admin/dashboard
+
 @router.get("/dashboard", response_model=DashboardStatsResponse)
 async def get_admin_dashboard_stats(
     time_range: Literal["daily", "weekly", "monthly"] = Query("weekly"),
