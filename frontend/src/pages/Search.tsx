@@ -78,9 +78,12 @@ export default function Search() {
     const [selectedImage, setSelectedImage] = useState<string | null>(null);
     const [currentText, setCurrentText] = useState<string>("");
     
+    // ✅ 원본 검색어 저장 (CLIP 검색 시 성별 필터용)
+    const [originalQuery, setOriginalQuery] = useState<string>("");
+    
     // UI 상태
     const [isAnalyzingImage, setIsAnalyzingImage] = useState(false);
-    const [isSearchingProducts, setIsSearchingProducts] = useState(false);  // ✅ NEW
+    const [isSearchingProducts, setIsSearchingProducts] = useState(false);
     const [showProducts, setShowProducts] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
     const [loadingStepIndex, setLoadingStepIndex] = useState(0); 
@@ -125,6 +128,9 @@ export default function Search() {
         setCurrentText("");
         setShowProducts(false);
         setTimestamp(Date.now());
+        
+        // ✅ 원본 검색어 저장
+        setOriginalQuery(currentQuery);
 
         const formData = new FormData();
         formData.append('query', currentQuery);
@@ -185,19 +191,21 @@ export default function Search() {
         
         // 상품이 이미 표시된 상태라면 해당 이미지로 재검색
         if (showProducts) {
-            await searchProductsByImage(imageBase64);
+            await searchProductsByImage(imageBase64, "full");
         }
     };
 
-    // 이미지 기반 상품 검색
-    const searchProductsByImage = async (imageBase64: string) => {
+    // ✅ 이미지 기반 상품 검색 (원본 쿼리 전달 + target 지정)
+    const searchProductsByImage = async (imageBase64: string, target: string = "full") => {
         setIsSearchingProducts(true);
         
         try {
-            // 1. AI 서비스에서 CLIP 벡터 생성
+            // ✅ 원본 쿼리 + target(전신/상의/하의) 전달
             const clipResponse = await client.post('/search/search-by-clip', {
                 image_b64: imageBase64,
-                limit: 12
+                limit: 12,
+                query: originalQuery,
+                target: target  // ✅ "full", "upper", "lower"
             });
             
             if (clipResponse.data && clipResponse.data.products) {
@@ -229,17 +237,44 @@ export default function Search() {
         }
     };
 
-    // 상품 보기 핸들러 - 선택된 이미지로 검색
+    // ✅ 상품 보기 핸들러 - 전체 코디
     const handleShowProducts = async () => {
         setShowProducts(true);
         
-        // 선택된 이미지가 있으면 해당 이미지로 상품 검색
         if (selectedImage) {
-            await searchProductsByImage(selectedImage);
+            await searchProductsByImage(selectedImage, "full");
         }
         
         setTimeout(() => {
             productSectionRef.current?.scrollIntoView({ behavior: 'smooth' });
+        }, 100);
+    };
+
+    // ✅ NEW: 상의만 검색
+    const handleShowUpperOnly = async () => {
+        setShowProducts(true);
+        
+        if (selectedImage) {
+            await searchProductsByImage(selectedImage, "upper");
+        }
+        
+        setTimeout(() => {
+            productSectionRef.current?.scrollIntoView({ behavior: 'smooth' });
+        }, 100);
+    };
+
+    // ✅ NEW: 하의만 검색
+    const handleShowLowerOnly = async () => {
+        setShowProducts(true);
+        
+        if (selectedImage) {
+            await searchProductsByImage(selectedImage, "lower");
+        }
+        
+        setTimeout(() => {
+            productSectionRef.current?.scrollIntoView({ behavior: 'smooth' });
+        }, 100);
+    };
         }, 100);
     };
 
@@ -424,11 +459,19 @@ export default function Search() {
                                             </>
                                         )}
                                     </button>
-                                    <button className="px-5 py-3 bg-white border border-gray-200 text-gray-600 rounded-full font-medium hover:bg-gray-50 hover:border-gray-300 transition-all">
-                                        상의만
+                                    <button 
+                                        onClick={handleShowUpperOnly}
+                                        disabled={isSearchingProducts}
+                                        className="px-5 py-3 bg-white border border-gray-200 text-gray-600 rounded-full font-medium hover:bg-purple-50 hover:border-purple-300 hover:text-purple-700 transition-all disabled:opacity-50"
+                                    >
+                                        👕 상의만
                                     </button>
-                                    <button className="px-5 py-3 bg-white border border-gray-200 text-gray-600 rounded-full font-medium hover:bg-gray-50 hover:border-gray-300 transition-all">
-                                        하의만
+                                    <button 
+                                        onClick={handleShowLowerOnly}
+                                        disabled={isSearchingProducts}
+                                        className="px-5 py-3 bg-white border border-gray-200 text-gray-600 rounded-full font-medium hover:bg-purple-50 hover:border-purple-300 hover:text-purple-700 transition-all disabled:opacity-50"
+                                    >
+                                        👖 하의만
                                     </button>
                                 </div>
                             </div>

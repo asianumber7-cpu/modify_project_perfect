@@ -1,3 +1,13 @@
+"""
+search.py - 수정된 버전 v2
+경로: backend-core/src/api/v1/endpoints/search.py
+
+수정 사항:
+1. 텍스트만 있어도 determine-path 호출
+2. EXTERNAL 경로일 때 CLIP 이미지 벡터로 검색 (핵심 수정!)
+3. 키워드 추출 시 연예인 검색 고려
+"""
+
 import logging
 import base64
 import asyncio
@@ -92,6 +102,8 @@ async def fetch_image_as_base64(url: str) -> Optional[str]:
 class ClipSearchRequest(BaseModel):
     image_b64: str
     limit: int = 12
+    query: Optional[str] = None  # ✅ 원본 검색어 (성별 추출용)
+    target: str = "full"  # ✅ "full", "upper", "lower"
 
 
 @router.post("/search-by-clip")
@@ -103,18 +115,44 @@ async def search_by_clip_image(
     이미지 기반 상품 검색
     - 후보 이미지 클릭 시 호출
     - 이미지 → CLIP 벡터 → 유사 상품 검색
+    - ✅ 원본 쿼리에서 성별 추출하여 필터링
+    - ✅ target: "full"(전체), "upper"(상의), "lower"(하의)
     """
-    logger.info(f"🖼️ CLIP Image Search Request (limit: {request.limit})")
+    logger.info(f"🖼️ CLIP Image Search Request (limit: {request.limit}, query: {request.query}, target: {request.target})")
+    
+    # ✅ 원본 쿼리에서 성별 추출
+    target_gender = None
+    if request.query:
+        target_gender = detect_gender_intent(request.query)
+        logger.info(f"📌 Detected gender from query: {target_gender}")
+    
+    # ✅ target에 따른 카테고리 필터
+    category_filter = None
+    if request.target == "upper":
+        category_filter = ["Tops", "Outerwear", "Shirts", "Sweaters", "상의", "아우터", "셔츠", "니트"]
+    elif request.target == "lower":
+        category_filter = ["Bottoms", "Pants", "Skirts", "하의", "바지", "치마"]
     
     AI_SERVICE_API_URL = settings.AI_SERVICE_API_URL
     
     try:
-        # 1. AI 서비스에서 CLIP 벡터 생성
+        # 1. AI 서비스에서 CLIP 벡터 생성 (YOLO + 영역 지정)
         async with httpx.AsyncClient(timeout=30.0) as client:
             clip_res = await client.post(
-                f"{AI_SERVICE_API_URL}/generate-clip-vector",
-                json={"image_b64": request.image_b64}
+                f"{AI_SERVICE_API_URL}/generate-fashion-clip-vector",
+                json={
+                    "image_b64": request.image_b64,
+                    "target": request.target  # ✅ 영역 지정
+                }
             )
+            
+            if clip_res.status_code != 200:
+                # Fallback: 기존 엔드포인트
+                logger.warning("⚠️ Fashion CLIP endpoint failed, falling back to standard CLIP")
+                clip_res = await client.post(
+                    f"{AI_SERVICE_API_URL}/generate-clip-vector",
+                    json={"image_b64": request.image_b64}
+                )
             
             if clip_res.status_code != 200:
                 raise HTTPException(status_code=500, detail="CLIP 벡터 생성 실패")
@@ -125,16 +163,17 @@ async def search_by_clip_image(
             if not clip_vector or len(clip_vector) != 512:
                 raise HTTPException(status_code=500, detail="유효하지 않은 CLIP 벡터")
         
-        logger.info(f"✅ CLIP vector generated: {len(clip_vector)} dims")
+        logger.info(f"✅ CLIP vector generated: {len(clip_vector)} dims (target: {request.target})")
         
-        # 2. CLIP 벡터로 상품 검색
+        # 2. CLIP 벡터로 상품 검색 (✅ 성별 필터 적용)
         results = await crud_product.search_by_clip_vector(
             db,
             clip_vector=clip_vector,
-            limit=request.limit
+            limit=request.limit,
+            filter_gender=target_gender  # ✅ 성별 필터 추가!
         )
         
-        logger.info(f"✅ CLIP search found {len(results)} products")
+        logger.info(f"✅ CLIP search found {len(results)} products (gender filter: {target_gender})")
         
         # 3. Response 구성
         product_responses = []
@@ -174,13 +213,16 @@ async def search_by_clip_image(
 
 @router.post("/analyze-image")
 async def analyze_image_proxy(request: ImageAnalysisRequest):
-    """개별 이미지 분석 프록시"""
+    """개별 이미지 분석 프록시 (후보 이미지 상세 분석)"""
     AI_SERVICE_API_URL = settings.AI_SERVICE_API_URL.rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            target_url = f"{AI_SERVICE_API_URL}/analyze-image"
+            # ✅ /analyze-image-detail 엔드포인트 호출 (JSON body 버전)
+            target_url = f"{AI_SERVICE_API_URL}/analyze-image-detail"
             if "/api/v1" not in AI_SERVICE_API_URL:
-                target_url = f"{AI_SERVICE_API_URL}/api/v1/analyze-image"
+                target_url = f"{AI_SERVICE_API_URL}/api/v1/analyze-image-detail"
+            
+            logger.info(f"📤 Calling AI Service: {target_url}")
 
             response = await client.post(
                 target_url,
@@ -188,6 +230,9 @@ async def analyze_image_proxy(request: ImageAnalysisRequest):
             )
             response.raise_for_status()
             return response.json()
+    except httpx.HTTPStatusError as e:
+        logger.error(f"❌ AI Service HTTP Error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(status_code=502, detail=f"AI Service Error: {e.response.status_code}")
     except Exception as e:
         logger.error(f"❌ Analysis Proxy Failed: {e}")
         raise HTTPException(status_code=500, detail=f"AI Service Error: {str(e)}")
@@ -297,11 +342,11 @@ async def ai_search(
                 logger.error(f"❌ AI Service failed after {max_retries} retries")
             await asyncio.sleep(1)
 
-    # 4. 검색 실행 - 경로에 따라 다른 전략
+    # 4. 🌟 검색 실행 - 경로에 따라 다른 전략
     results = []
     
     try:
-        # 핵심 수정: EXTERNAL 경로 (연예인 패션 등) → CLIP 이미지 벡터로 검색
+        # ✅ 핵심 수정: EXTERNAL 경로 (연예인 패션 등) → CLIP 이미지 벡터로 검색
         if search_path == "EXTERNAL" and clip_vec and len(clip_vec) == 512:
             logger.info(f"🖼️ Using CLIP image vector search (512-dim)")
             

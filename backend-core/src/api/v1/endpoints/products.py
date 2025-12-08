@@ -90,7 +90,7 @@ async def _heal_product_embedding(db: AsyncSession, product: Any) -> Any:
 
 
 # =========================================================
-# 1️⃣ [API] 이미지 자동 분석 업로드 (단일)
+# 1️⃣ [API] 이미지 자동 분석 업로드 (단일) - CLIP 벡터 추가!
 # =========================================================
 @router.post("/upload/image-auto", response_model=ProductResponse)
 async def upload_product_image_auto(
@@ -162,11 +162,21 @@ async def upload_product_image_auto(
     except:
         final_price = 0
 
+    # BERT 벡터 (768차원)
     vector = ai_analyzed_data.get("vector", [])
     if not vector:
-        logger.warning("⚠️ Empty vector received from AI. Product will be saved but not searchable.")
+        logger.warning("⚠️ Empty BERT vector received from AI.")
 
-    # [Step D] DB 저장
+    # ============================================================
+    # [NEW] CLIP 벡터 (512차원) - 시각적 유사도 검색용
+    # ============================================================
+    vector_clip = ai_analyzed_data.get("vector_clip", [])
+    if not vector_clip:
+        logger.warning("⚠️ Empty CLIP vector received from AI. Image-based search will be limited.")
+
+    logger.info(f"📊 Vectors received - BERT: {len(vector)}dim, CLIP: {len(vector_clip)}dim")
+
+    # [Step D] DB 저장 - embedding_clip 추가!
     product_in_data = {
         "name": sanitize_string(final_name),
         "category": sanitize_string(ai_analyzed_data.get("category", "Uncategorized")),
@@ -174,7 +184,8 @@ async def upload_product_image_auto(
         "price": final_price,
         "stock_quantity": 100,
         "image_url": final_image_url,
-        "embedding": vector,
+        "embedding": vector,              # BERT (768차원)
+        "embedding_clip": vector_clip,    # CLIP (512차원) - 신규!
         "gender": final_gender,
         "is_active": True
     }
@@ -182,6 +193,7 @@ async def upload_product_image_auto(
     try:
         new_product = await crud_product.create(db, obj_in=product_in_data)
         new_product = await _heal_product_embedding(db, new_product)
+        logger.info(f"✅ Product created with ID {new_product.id} (BERT + CLIP vectors saved)")
         return new_product
     except Exception as e:
         logger.error(f"DB Insert Error: {e}")
@@ -189,7 +201,7 @@ async def upload_product_image_auto(
 
 
 # =========================================================
-# 2️⃣ [Mode 2] CSV 대량 업로드 
+# 2️⃣ [Mode 2] CSV 대량 업로드 - CLIP 벡터 추가!
 # =========================================================
 @router.post("/upload/csv")
 async def upload_products_csv(
@@ -236,6 +248,7 @@ async def upload_products_csv(
             
             image_url = row.get("image_url") or row.get("이미지") or "https://placehold.co/400x500?text=No+Image"
 
+            # BERT 벡터 생성
             vector = []
             text_for_vector = f"[{gender}] {name} {category} {description}"
             
@@ -251,6 +264,30 @@ async def upload_products_csv(
                 except Exception:
                     pass 
 
+            # ============================================================
+            # [NEW] CLIP 벡터 생성 (이미지 URL에서)
+            # ============================================================
+            vector_clip = []
+            if image_url and not image_url.startswith("https://placehold"):
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        # 이미지 다운로드
+                        img_response = await client.get(image_url)
+                        if img_response.status_code == 200:
+                            import base64
+                            image_b64 = base64.b64encode(img_response.content).decode("utf-8")
+                            
+                            # CLIP 벡터 생성 요청
+                            clip_res = await client.post(
+                                f"{AI_SERVICE_API_URL}/generate-clip-vector",
+                                json={"image_b64": image_b64}
+                            )
+                            if clip_res.status_code == 200:
+                                vector_clip = clip_res.json().get("vector", [])
+                                logger.info(f"✅ CLIP vector generated for {name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ CLIP vector generation failed for {name}: {e}")
+
             product_in = {
                 "name": sanitize_string(name),
                 "category": sanitize_string(category),
@@ -258,7 +295,8 @@ async def upload_products_csv(
                 "price": price,
                 "stock_quantity": stock,
                 "image_url": image_url,
-                "embedding": vector,
+                "embedding": vector,              # BERT
+                "embedding_clip": vector_clip,    # CLIP - 신규!
                 "gender": gender,
                 "is_active": True
             }
@@ -292,7 +330,7 @@ async def create_product(
     for key, value in product_data.items():
         product_data[key] = sanitize_string(value)
 
-    # 임베딩 생성
+    # BERT 임베딩 생성
     embedding_vector = []
     text_to_embed = f"상품명: {product_data['name']} | 카테고리: {product_data.get('category', '')} | 설명: {product_data.get('description', '')}"
     AI_SERVICE_API_URL = settings.AI_SERVICE_API_URL
@@ -307,10 +345,16 @@ async def create_product(
             if response.status_code == 200:
                 embedding_vector = response.json().get("vector", [])
     except Exception as e:
-        logger.error(f"❌ Failed to generate embedding: {e}")
+        logger.error(f"❌ Failed to generate BERT embedding: {e}")
 
     if embedding_vector:
         product_data["embedding"] = embedding_vector
+
+    # ============================================================
+    # [NEW] CLIP 벡터는 이미지가 있을 때만 생성 (추후 이미지 업로드 시)
+    # ============================================================
+    # 직접 생성 API에서는 이미지가 없으므로 CLIP 벡터는 비워둠
+    # 이미지 업로드 시 별도로 생성하거나, 이미지 URL이 있으면 생성 가능
 
     product = await crud_product.create(db, obj_in=product_data)
     return product

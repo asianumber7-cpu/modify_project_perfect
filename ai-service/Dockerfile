@@ -1,68 +1,49 @@
 # ---------------------------------------------------
-# AI Service Module Dockerfile (Optimized)
-# 위치: ./ai-service/Dockerfile
+# AI Service Dockerfile (CPU Development Optimized)
+# 목표: 빌드 시간 30분 -> 3분 단축
 # ---------------------------------------------------
 
-# 1. Builder Stage
-FROM python:3.11.14-slim AS builder
+# 1. Base Image
+FROM python:3.11.14-slim
 
-# [최적화 1] 빌드 필수 패키지 설치
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# pip 자체 업그레이드 (먼저 실행하여 캐시 활용)
-RUN pip install --upgrade pip setuptools wheel
-
-# [최적화 2] 가장 무거운 PyTorch를 먼저 단독 설치 (캐시 레이어 생성)
-# requirements.txt가 바뀌어도 이 줄은 캐시되어 다시 실행되지 않음 (약 3~5분 절약)
-# GPU(CUDA) 버전이 필요하면 아래 줄 그대로 사용. 
-# 만약 개발용이라 CPU만 필요하다면 끝에 '--index-url https://download.pytorch.org/whl/cpu' 추가 추천
-RUN pip install --no-cache-dir torch==2.1.2 
-
-# [최적화 3] 나머지 의존성 설치
-# requirements.txt에서 torch==2.1.2 줄은 있어도 되고 없어도 됨 (이미 설치됨으로 넘어감)
-COPY requirements.txt .
-
-# --default-timeout 옵션: 네트워크 느릴 때 끊김 방지
-RUN pip install --no-cache-dir --default-timeout=100 -r requirements.txt
-
-# ---------------------------------------------------
-
-# 2. Runner Stage
-FROM python:3.11.14-slim AS runner
-
+# 환경 변수 설정
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    TZ=Asia/Seoul \
-    HF_HOME=/app/models_cache \
-    PATH="/opt/venv/bin:$PATH"
+    # uv가 가상환경을 만들지 않고 시스템에 직접 설치하게 함 (Docker 내에서는 더 효율적)
+    UV_SYSTEM_PYTHON=1 \
+    # Hugging Face 모델 캐시 경로 (재다운로드 방지)
+    HF_HOME=/app/models_cache
 
 WORKDIR /app
 
-# 런타임 필수 라이브러리
+# 2. 시스템 패키지 설치
+# libgl1-mesa-glx, libglib2.0-0: YOLO(OpenCV) 실행을 위한 필수 의존성입니다.
+# curl: 헬스체크 및 유틸리티용
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     curl \
-    libgomp1 \
-    libgl1 \
+    libgl1-mesa-glx \
     libglib2.0-0 \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Builder에서 생성한 가상환경 복사
-COPY --from=builder /opt/venv /opt/venv
+# 3. uv 설치 (세계에서 가장 빠른 Python 패키지 매니저)
+# pip 대신 사용하여 의존성 해결 시간을 획기적으로 줄입니다.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-# 유저 설정
-RUN addgroup --system appgroup && adduser --system --group appuser
-RUN mkdir -p /app/models_cache && chown -R appuser:appgroup /app
+# 4. PyTorch CPU 버전 우선 설치 (속도 혁신의 핵심)
+# GPU(CUDA) 관련 거대 파일(2GB+)을 제외하고 CPU 버전만 받아 빌드 속도를 높입니다.
+# 개발 단계에서는 이 설정이 필수적입니다.
+RUN uv pip install torch==2.1.2 torchvision --index-url https://download.pytorch.org/whl/cpu
 
-# 소스 코드 복사 (가장 자주 바뀌므로 맨 마지막에 배치)
+# 5. Requirements 설치
+COPY requirements.txt .
+# --no-cache를 쓰지 않아도 uv는 빠르고 안전합니다.
+RUN uv pip install -r requirements.txt
+
+# 6. 소스 코드 복사
 COPY . .
-RUN chown -R appuser:appgroup /app
 
-USER appuser
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 7. 실행 명령
+# 구조 분석 결과: main.py가 'src' 폴더 안에 있으므로 'src.main:app'이 정확합니다.
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

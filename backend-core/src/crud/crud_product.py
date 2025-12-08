@@ -1,3 +1,13 @@
+"""
+crud_product.py - 수정된 버전 v2
+경로: backend-core/src/crud/crud_product.py
+
+수정 사항:
+1. search_hybrid에 exclude_category, exclude_id 파라미터 추가
+2. search_by_vector에 filter_gender 파라미터 추가
+3. ✅ NEW: search_by_clip_vector - CLIP 이미지 벡터 기반 검색
+"""
+
 from typing import List, Optional, Any, Union, Dict
 from datetime import datetime
 from sqlalchemy import select, update, func, text, case, or_, and_
@@ -49,7 +59,7 @@ class CRUDProduct:
         return await self.get(db, product_id)
 
     # -------------------------------------------------------
-    #  스마트 하이브리드 검색 - 키워드 우선 + 벡터 보조
+    # 🔍 [NEW] 스마트 하이브리드 검색 - 키워드 우선 + 벡터 보조
     # -------------------------------------------------------
     async def search_smart_hybrid(
         self,
@@ -86,7 +96,7 @@ class CRUDProduct:
         seen_ids = set()
 
         # =====================================================
-        # 1단계: 키워드 정확 매칭 (최우선)
+        # 🥇 1단계: 키워드 정확 매칭 (최우선)
         # =====================================================
         if query and len(query.strip()) >= 2:
             # 핵심 키워드 추출 (조사 제거)
@@ -127,7 +137,7 @@ class CRUDProduct:
                             return final_results
 
         # =====================================================
-        # 2단계: 벡터 유사도 검색 (보완)
+        # 🥈 2단계: 벡터 유사도 검색 (보완)
         # =====================================================
         if len(final_results) < limit and bert_vector and len(bert_vector) == 768:
             remaining = limit - len(final_results)
@@ -149,7 +159,7 @@ class CRUDProduct:
                     seen_ids.add(product.id)
 
         # =====================================================
-        # 3단계: 최신 상품 Fallback
+        # 🥉 3단계: 최신 상품 Fallback
         # =====================================================
         if len(final_results) < limit:
             remaining = limit - len(final_results)
@@ -202,7 +212,7 @@ class CRUDProduct:
         return keywords
 
     # -------------------------------------------------------
-    # CLIP 이미지 벡터 기반 검색 (시각적 유사도)
+    # ✅ [NEW] CLIP 이미지 벡터 기반 검색 (시각적 유사도)
     # -------------------------------------------------------
     async def search_by_clip_vector(
         self, 
@@ -220,7 +230,11 @@ class CRUDProduct:
         - 연예인 패션 검색 등 이미지 기반 검색에 사용
         - embedding_clip 컬럼 사용
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        
         if not clip_vector or len(clip_vector) != 512:
+            logger.warning("❌ Invalid CLIP vector (expected 512 dims)")
             return []
         
         conditions = [
@@ -254,17 +268,54 @@ class CRUDProduct:
         if max_price is not None:
             conditions.append(Product.price <= max_price)
         
-        stmt = select(Product).where(*conditions)
-        
-        # CLIP 벡터 코사인 거리로 정렬
+        # ✅ 코사인 거리 계산 (거리가 작을수록 유사)
         dist = Product.embedding_clip.cosine_distance(clip_vector)
+        
+        # ✅ SELECT에 거리 포함하여 로깅용
+        stmt = select(Product, dist.label('distance')).where(*conditions)
         stmt = stmt.order_by(dist).limit(limit)
         
         result = await db.execute(stmt)
-        return list(result.scalars().all())
+        rows = result.all()
+        
+        # ✅ 유사도 점수 상세 로깅
+        products = []
+        logger.info("=" * 70)
+        logger.info(f"📊 CLIP 유사도 검색 결과 (상위 {len(rows)}개, 성별필터: {filter_gender})")
+        logger.info("=" * 70)
+        
+        total_similarity = 0
+        for i, row in enumerate(rows):
+            product = row[0]
+            distance = float(row[1]) if row[1] is not None else 1.0
+            similarity = 1.0 - distance  # 코사인 유사도 = 1 - 거리
+            total_similarity += similarity
+            
+            # 상품명 truncate
+            name_display = product.name[:25] + "..." if len(product.name) > 25 else product.name
+            
+            logger.info(
+                f"  #{i+1:2d} | ID:{product.id:4d} | {name_display:<28} | "
+                f"거리:{distance:.4f} | 유사도:{similarity:.4f} ({similarity*100:.1f}%) | "
+                f"성별:{product.gender or 'N/A'} | 카테고리:{product.category}"
+            )
+            
+            products.append(product)
+        
+        logger.info("-" * 70)
+        if rows:
+            avg_similarity = total_similarity / len(rows)
+            logger.info(f"📈 평균 유사도: {avg_similarity:.4f} ({avg_similarity*100:.1f}%)")
+            
+            # 유사도가 너무 낮으면 경고
+            if avg_similarity < 0.3:
+                logger.warning(f"⚠️ 평균 유사도가 매우 낮음 ({avg_similarity*100:.1f}%) - CLIP 벡터 품질 확인 필요")
+        logger.info("=" * 70)
+        
+        return products
 
     # -------------------------------------------------------
-    # 기존 하이브리드 검색
+    # 🔧 [UPDATED] 기존 하이브리드 검색 - exclude 파라미터 추가
     # -------------------------------------------------------
     async def search_hybrid(
         self, 
@@ -299,12 +350,12 @@ class CRUDProduct:
         if max_price is not None:
             base_conditions.append(Product.price <= max_price)
         
-        #  카테고리 제외
+        # ✅ 추가: 카테고리 제외
         if exclude_category:
             for cat in exclude_category:
                 base_conditions.append(Product.category != cat)
         
-        # ID 제외
+        # ✅ 추가: ID 제외
         if exclude_id:
             base_conditions.append(Product.id.notin_(exclude_id))
 
@@ -343,7 +394,7 @@ class CRUDProduct:
         return list(result.scalars().all())
 
     # -------------------------------------------------------
-    # 벡터 검색 
+    # 🔧 [UPDATED] 벡터 검색 - filter_gender 파라미터 추가
     # -------------------------------------------------------
     async def search_by_vector(
         self, 
@@ -354,6 +405,7 @@ class CRUDProduct:
         exclude_id: Optional[List[int]] = None,
         min_price: Optional[int] = None,
         max_price: Optional[int] = None,
+        # ✅ 추가: 성별 필터
         filter_gender: Optional[str] = None,
         **kwargs
     ) -> List[Product]:
@@ -382,7 +434,7 @@ class CRUDProduct:
         if max_price is not None:
             conditions.append(Product.price <= max_price)
         
-        # 성별 필터
+        # ✅ 추가: 성별 필터
         if filter_gender:
             conditions.append(
                 or_(

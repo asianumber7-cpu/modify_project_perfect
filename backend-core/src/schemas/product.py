@@ -12,15 +12,21 @@ class ProductBase(BaseModel):
     image_url: Optional[str] = None
 
 class ProductCreate(ProductBase):
-    pass
+    gender: Optional[str] = Field(None, examples=["Unisex"])
+    embedding: Optional[List[float]] = None        # BERT 벡터 (768차원)
+    embedding_clip: Optional[List[float]] = None   # CLIP 벡터 (512차원) - 신규 추가
 
 class ProductUpdate(ProductBase):
     name: Optional[str] = None
     price: Optional[int] = None
     stock_quantity: Optional[int] = None
+    gender: Optional[str] = None
+    embedding: Optional[List[float]] = None
+    embedding_clip: Optional[List[float]] = None
 
 class ProductResponse(ProductBase):
     id: int
+    gender: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     

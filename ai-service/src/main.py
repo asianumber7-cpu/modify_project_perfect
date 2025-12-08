@@ -44,7 +44,8 @@ class ImageAnalysisResponse(BaseModel):
     gender: str
     description: str
     price: int
-    vector: List[float]
+    vector: List[float]           # BERT 벡터 (768차원)
+    vector_clip: List[float]      # CLIP 벡터 (512차원) - 신규 추가
 
 class PathRequest(BaseModel):
     query: str
@@ -111,6 +112,11 @@ async def embed_text(request: EmbedRequest):
 
 @api_router.post("/analyze-image", response_model=ImageAnalysisResponse)
 async def analyze_image(file: UploadFile = File(...)):
+    """
+    이미지 분석 및 상품 정보 생성
+    - BERT 벡터 (768차원): 텍스트 기반 검색용
+    - CLIP 벡터 (512차원): 이미지 기반 시각적 유사도 검색용
+    """
     filename = file.filename
     try:
         contents = await file.read()
@@ -183,10 +189,30 @@ async def analyze_image(file: UploadFile = File(...)):
         except:
             price = 0
 
+        # ============================================================
+        # [BERT 벡터] 텍스트 기반 임베딩 (768차원)
+        # ============================================================
         meta_text = f"[{final_gender}] {final_name} {final_cat} {final_desc}"
         vector = model_engine.generate_embedding(meta_text)
 
+        # ============================================================
+        # [CLIP 벡터] 이미지 기반 시각적 임베딩 (512차원) - 신규 추가!
+        # ============================================================
+        vector_clip = []
+        try:
+            clip_result = model_engine.generate_image_embedding(image_b64)
+            vector_clip = clip_result.get("clip", [])
+            if vector_clip:
+                logger.info(f"🖼️ CLIP vector generated: {len(vector_clip)} dimensions")
+            else:
+                logger.warning("⚠️ CLIP vector empty, using zeros")
+                vector_clip = [0.0] * 512
+        except Exception as e:
+            logger.error(f"❌ CLIP vector generation failed: {e}")
+            vector_clip = [0.0] * 512
+
         logger.info(f"✅ Analysis Success: {final_name} ({final_gender}) - {price}원")
+        logger.info(f"   📊 BERT: {len(vector)}dim, CLIP: {len(vector_clip)}dim")
 
         return {
             "name": final_name,
@@ -194,7 +220,8 @@ async def analyze_image(file: UploadFile = File(...)):
             "gender": final_gender,
             "description": final_desc,
             "price": price,
-            "vector": vector
+            "vector": vector,           # BERT 768차원
+            "vector_clip": vector_clip  # CLIP 512차원
         }
 
     except Exception as e:
@@ -205,7 +232,8 @@ async def analyze_image(file: UploadFile = File(...)):
             "gender": "Unisex",
             "description": "이미지 분석 실패.",
             "price": 0,
-            "vector": [0.0] * 768
+            "vector": [0.0] * 768,
+            "vector_clip": [0.0] * 512
         }
 
 @api_router.post("/llm-generate-response")
@@ -218,9 +246,9 @@ async def llm_generate(body: Dict[str, str]):
     except:
         return {"answer": "죄송합니다. AI 응답을 생성할 수 없습니다."}
     
-@app.post("/api/v1/analyze-image")
-async def analyze_image_endpoint(req: AnalyzeRequest):
-    """특정 이미지에 대한 상세 분석 요청"""
+@api_router.post("/analyze-image-detail")
+async def analyze_image_detail(req: AnalyzeRequest):
+    """특정 이미지에 대한 상세 분석 요청 (RAG용 - base64 이미지)"""
     result = await rag_orchestrator.analyze_specific_image(req.image_b64, req.query)
     return {"analysis": result}    
 
@@ -243,8 +271,8 @@ async def generate_clip_vector(request: ClipVectorRequest):
         if "base64," in image_b64:
             image_b64 = image_b64.split("base64,")[1]
         
-        # CLIP Vision 모델로 벡터 생성
-        result = model_engine.generate_image_embedding(image_b64)
+        # CLIP Vision 모델로 벡터 생성 (YOLO 적용)
+        result = model_engine.generate_image_embedding(image_b64, use_yolo=True)
         clip_vector = result.get("clip", [])
         
         if not clip_vector or len(clip_vector) == 0:
@@ -259,6 +287,74 @@ async def generate_clip_vector(request: ClipVectorRequest):
         
     except Exception as e:
         logger.error(f"❌ CLIP vector generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ✅ NEW: 패션 특화 CLIP 벡터 생성 (YOLO + 상의/하의 분리)
+class FashionClipRequest(BaseModel):
+    image_b64: str
+    target: str = "full"  # "full", "upper", "lower"
+
+
+@api_router.post("/generate-fashion-clip-vector")
+async def generate_fashion_clip_vector(request: FashionClipRequest):
+    """
+    ✅ 패션 특화 CLIP 벡터 생성
+    - YOLO로 사람/옷 영역 감지 후 크롭
+    - target: "full"(전신), "upper"(상의), "lower"(하의)
+    """
+    try:
+        image_b64 = request.image_b64
+        target = request.target
+        
+        # data:image/... 형식이면 base64 부분만 추출
+        if "base64," in image_b64:
+            image_b64 = image_b64.split("base64,")[1]
+        
+        # PIL Image로 변환
+        import io
+        from PIL import Image
+        pil_image = Image.open(io.BytesIO(base64.b64decode(image_b64)))
+        
+        # YOLO로 영역 크롭 후 CLIP 벡터 생성
+        try:
+            from src.core.yolo_detector import yolo_detector
+            
+            # YOLO 초기화
+            if not yolo_detector.initialized:
+                yolo_detector.initialize()
+            
+            # 지정된 영역 크롭
+            cropped = yolo_detector.crop_fashion_regions(pil_image, target=target)
+            
+            if cropped is not None:
+                logger.info(f"✂️ YOLO cropped '{target}' region: {cropped.size}")
+                pil_image = cropped
+            else:
+                logger.warning(f"⚠️ YOLO crop failed for '{target}', using original")
+                
+        except ImportError as e:
+            logger.warning(f"⚠️ YOLO not available: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ YOLO failed: {e}")
+        
+        # CLIP 벡터 생성 (YOLO 중복 적용 방지)
+        result = model_engine.generate_image_embedding(pil_image, use_yolo=False)
+        clip_vector = result.get("clip", [])
+        
+        if not clip_vector or len(clip_vector) == 0:
+            raise HTTPException(status_code=500, detail="CLIP 벡터 생성 실패")
+        
+        logger.info(f"✅ Fashion CLIP vector generated ({target}): {len(clip_vector)} dimensions")
+        
+        return {
+            "vector": clip_vector,
+            "dimension": len(clip_vector),
+            "target": target
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Fashion CLIP vector generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
