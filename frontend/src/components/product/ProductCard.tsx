@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Heart, ShoppingCart } from 'lucide-react';
+import { getImageUrl } from '../../utils/imageUtils';
 
 // 백엔드 스키마와 일치하는 타입 정의
 export interface ProductResponse {
@@ -21,10 +22,8 @@ interface ProductCardProps {
 export default function ProductCard({ product }: ProductCardProps) {
     const [isLiked, setIsLiked] = useState(false);
     
-    // 이미지 예외 처리 강화
-    const displayImage = product.image_url && product.image_url.startsWith('http') 
-        ? product.image_url 
-        : 'https://placehold.co/400x500/e2e8f0/64748b?text=No+Image';
+    // ✅ FIX: 이미지 URL 변환 유틸리티 사용
+    const displayImage = getImageUrl(product.image_url);
         
     const formattedPrice = new Intl.NumberFormat('ko-KR').format(product.price);
 

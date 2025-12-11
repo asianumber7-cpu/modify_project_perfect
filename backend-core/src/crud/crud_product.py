@@ -1,23 +1,58 @@
-"""
-crud_product.py - 수정된 버전 v2
-경로: backend-core/src/crud/crud_product.py
-
-수정 사항:
-1. search_hybrid에 exclude_category, exclude_id 파라미터 추가
-2. search_by_vector에 filter_gender 파라미터 추가
-3. ✅ NEW: search_by_clip_vector - CLIP 이미지 벡터 기반 검색
-"""
-
-from typing import List, Optional, Any, Union, Dict
+from typing import List, Optional, Any, Union, Dict, Tuple
 from datetime import datetime
-from sqlalchemy import select, update, func, text, case, or_, and_
+from sqlalchemy import select, update, func, text, case, or_, and_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
+import logging
 
 from src.models.product import Product
 from src.schemas.product import ProductCreate, ProductUpdate 
 
+logger = logging.getLogger(__name__)
+
 class CRUDProduct:
-    # 기본 CRUD 메서드
+    # ===============================================================
+    # 🛡️ [Fix] 벡터 안전장치 (DB 에러 방지)
+    # ===============================================================
+    def _validate_vector(self, vector: Optional[List[float]], dim: int) -> List[float]:
+        """
+        DB Insert/Update 직전 최종 벡터 검증
+        - None이거나 빈 리스트면 0.0으로 채워진 벡터 반환 (DB 에러 원천 차단)
+        """
+        if not vector or len(vector) == 0:
+            return [0.0] * dim
+        
+        if len(vector) != dim:
+            if len(vector) < dim:
+                return vector + [0.0] * (dim - len(vector))
+            else:
+                return vector[:dim]
+        return vector
+
+    # ===============================================================
+    # ✅ [NEW] 유사도 계산 헬퍼
+    # ===============================================================
+    def _distance_to_similarity(self, distance: float) -> float:
+        """
+        코사인 거리를 유사도 점수로 변환
+        - cosine_distance: 0 (동일) ~ 2 (정반대)
+        - similarity: 1.0 (동일) ~ 0.0 (정반대)
+        """
+        # 코사인 거리 = 1 - 코사인 유사도
+        # 따라서 유사도 = 1 - 거리
+        similarity = max(0.0, min(1.0, 1.0 - distance))
+        return round(similarity, 4)
+
+    def _attach_similarity(self, product: Product, distance: Optional[float]) -> Product:
+        """Product 객체에 similarity 속성 동적 추가"""
+        if distance is not None:
+            product.similarity = self._distance_to_similarity(distance)
+        else:
+            product.similarity = None
+        return product
+
+    # ===============================================================
+    # ⚙️ 기본 CRUD
+    # ===============================================================
     async def get(self, db: AsyncSession, product_id: int) -> Optional[Product]:
         stmt = select(Product).where(Product.id == product_id, Product.deleted_at.is_(None))
         result = await db.execute(stmt)
@@ -33,6 +68,17 @@ class CRUDProduct:
             create_data = obj_in
         else: 
             create_data = obj_in.model_dump(exclude_unset=True)
+        
+        # [Fix] 벡터 검증 및 보정 적용
+        if "embedding" in create_data:
+            create_data["embedding"] = self._validate_vector(create_data.get("embedding"), 768)
+        if "embedding_clip" in create_data:
+            create_data["embedding_clip"] = self._validate_vector(create_data.get("embedding_clip"), 512)
+        if "embedding_clip_upper" in create_data:
+            create_data["embedding_clip_upper"] = self._validate_vector(create_data.get("embedding_clip_upper"), 512)
+        if "embedding_clip_lower" in create_data:
+            create_data["embedding_clip_lower"] = self._validate_vector(create_data.get("embedding_clip_lower"), 512)
+
         db_obj = Product(**create_data)
         db.add(db_obj)
         await db.commit()
@@ -44,6 +90,10 @@ class CRUDProduct:
             update_data = obj_in
         else: 
             update_data = obj_in.model_dump(exclude_unset=True)
+        
+        if "embedding" in update_data:
+             update_data["embedding"] = self._validate_vector(update_data["embedding"], 768)
+
         for field, value in update_data.items(): 
             setattr(db_obj, field, value)
         db.add(db_obj)
@@ -58,8 +108,26 @@ class CRUDProduct:
         await db.commit()
         return await self.get(db, product_id)
 
+    # ===============================================================
+    # 🗑️ [NEW] 하드 삭제 (완전 삭제)
+    # ===============================================================
+    async def hard_delete(self, db: AsyncSession, *, product_id: int) -> bool:
+        """
+        상품을 DB에서 완전히 삭제합니다.
+        - 벡터 데이터도 함께 삭제됨
+        - 이미지 파일 삭제는 API 레이어에서 처리
+        """
+        stmt = delete(Product).where(Product.id == product_id)
+        result = await db.execute(stmt)
+        await db.commit()
+        return result.rowcount > 0
+
+    # ===============================================================
+    # 🔍 검색 로직
+    # ===============================================================
+
     # -------------------------------------------------------
-    # 🔍 [NEW] 스마트 하이브리드 검색 - 키워드 우선 + 벡터 보조
+    # 1. ✅ [FIX] 스마트 하이브리드 검색 (similarity 반환)
     # -------------------------------------------------------
     async def search_smart_hybrid(
         self,
@@ -70,149 +138,118 @@ class CRUDProduct:
         limit: int = 12,
         filter_gender: Optional[str] = None
     ) -> List[Product]:
-        """
-        스마트 하이브리드 검색:
-        1단계: 키워드 매칭 상품 (이름/설명에 검색어 포함)
-        2단계: 벡터 유사도로 정렬
-        3단계: 부족하면 벡터 검색으로 보완
-        """
         
-        # 기본 필터
         base_conditions = [
             Product.is_active == True,
             Product.deleted_at.is_(None)
         ]
         
+        # ✅ [FIX] 성별 필터 조건 (별도 보관)
+        gender_condition = None
         if filter_gender:
-            base_conditions.append(
-                or_(
-                    Product.gender == filter_gender,
-                    Product.gender == 'Unisex',
-                    Product.gender.is_(None)
-                )
+            gender_condition = or_(
+                Product.gender == filter_gender,
+                Product.gender == 'Unisex',
+                Product.gender.is_(None)
             )
+            base_conditions.append(gender_condition)
+            logger.info(f"🎯 Gender filter applied: {filter_gender}")
 
         final_results = []
         seen_ids = set()
 
-        # =====================================================
-        # 🥇 1단계: 키워드 정확 매칭 (최우선)
-        # =====================================================
-        if query and len(query.strip()) >= 2:
-            # 핵심 키워드 추출 (조사 제거)
+        # [Step 1] 키워드 매칭 (with similarity)
+        keyword_found = False
+        if query and len(query.strip()) >= 1:
             keywords = self._extract_keywords(query)
+            logger.info(f"🔑 Extracted keywords: {keywords}")
             
             for keyword in keywords:
-                if len(keyword) < 2:
-                    continue
-                    
+                if len(keyword) < 1: continue
                 search_pattern = f"%{keyword}%"
                 
-                stmt = select(Product).where(
-                    *base_conditions,
-                    or_(
-                        Product.name.ilike(search_pattern),
-                        Product.description.ilike(search_pattern),
-                        Product.category.ilike(search_pattern)
-                    )
-                )
-                
-                # 벡터가 있으면 벡터 유사도순, 없으면 최신순
+                # 벡터가 있으면 distance 계산
                 if bert_vector and len(bert_vector) == 768:
-                    stmt = stmt.where(Product.embedding.is_not(None))
                     dist = Product.embedding.cosine_distance(bert_vector)
-                    stmt = stmt.order_by(dist)
+                    stmt = select(Product, dist.label('distance')).where(
+                        *base_conditions,
+                        Product.embedding.is_not(None),
+                        or_(
+                            Product.name.ilike(search_pattern),
+                            Product.description.ilike(search_pattern),
+                            Product.category.ilike(search_pattern)
+                        )
+                    ).order_by(dist).limit(limit)
                 else:
-                    stmt = stmt.order_by(Product.created_at.desc())
+                    # 벡터 없으면 distance = None
+                    stmt = select(Product, text('NULL as distance')).where(
+                        *base_conditions,
+                        or_(
+                            Product.name.ilike(search_pattern),
+                            Product.description.ilike(search_pattern),
+                            Product.category.ilike(search_pattern)
+                        )
+                    ).order_by(Product.created_at.desc()).limit(limit)
                 
-                stmt = stmt.limit(limit)
                 result = await db.execute(stmt)
+                rows = result.all()
                 
-                for product in result.scalars().all():
+                for row in rows:
+                    product = row[0]
+                    distance = row[1] if len(row) > 1 else None
+                    
                     if product.id not in seen_ids:
+                        self._attach_similarity(product, distance)
                         final_results.append(product)
                         seen_ids.add(product.id)
-                        
-                        if len(final_results) >= limit:
-                            return final_results
+                        keyword_found = True
 
-        # =====================================================
-        # 🥈 2단계: 벡터 유사도 검색 (보완)
-        # =====================================================
-        if len(final_results) < limit and bert_vector and len(bert_vector) == 768:
-            remaining = limit - len(final_results)
+        # [Fix] 키워드로 찾은 게 있으면 여기서 종료 (정확도 우선)
+        if keyword_found and len(final_results) > 0:
+            logger.info(f"✅ Keyword search found {len(final_results)} products")
+            return final_results
+
+        # [Step 2] 벡터 검색 (키워드 결과 없을 때만 Fallback)
+        if len(final_results) == 0 and bert_vector and len(bert_vector) == 768:
+            logger.info(f"🔄 Falling back to vector search")
             
-            stmt = select(Product).where(
+            dist = Product.embedding.cosine_distance(bert_vector)
+            stmt = select(Product, dist.label('distance')).where(
                 *base_conditions,
                 Product.embedding.is_not(None),
                 Product.id.notin_(seen_ids) if seen_ids else True
-            )
-            
-            dist = Product.embedding.cosine_distance(bert_vector)
-            stmt = stmt.order_by(dist).limit(remaining)
+            ).order_by(dist).limit(limit)
             
             result = await db.execute(stmt)
+            rows = result.all()
             
-            for product in result.scalars().all():
+            for row in rows:
+                product = row[0]
+                distance = row[1] if len(row) > 1 else None
+                
                 if product.id not in seen_ids:
-                    final_results.append(product)
-                    seen_ids.add(product.id)
-
-        # =====================================================
-        # 🥉 3단계: 최신 상품 Fallback
-        # =====================================================
-        if len(final_results) < limit:
-            remaining = limit - len(final_results)
-            
-            stmt = select(Product).where(
-                *base_conditions,
-                Product.id.notin_(seen_ids) if seen_ids else True
-            )
-            stmt = stmt.order_by(Product.created_at.desc()).limit(remaining)
-            
-            result = await db.execute(stmt)
-            
-            for product in result.scalars().all():
-                if product.id not in seen_ids:
+                    self._attach_similarity(product, distance)
                     final_results.append(product)
                     seen_ids.add(product.id)
 
         return final_results
 
     def _extract_keywords(self, query: str) -> List[str]:
-        """검색어에서 핵심 키워드 추출 (조사 제거)"""
         import re
-        
-        # 불용어 정의
-        stop_words = {
-            "추천", "해줘", "보여줘", "찾아줘", "알려줘", "어때", 
-            "사진", "이미지", "스타일", "패션", "옷", "의류",
-            "남자", "여자", "남성", "여성", "용"
-        }
-        
-        # 조사 패턴
-        particle_pattern = r'(은|는|이|가|을|를|의|에|로|으로|과|와|도|만|부터|까지|에서|보다|처럼|같은|위한|에게|한테|께)$'
-        
+        stop_words = {"추천", "해줘", "보여줘", "찾아줘", "알려줘", "어때", "사진", "이미지", "스타일", "패션", "옷"}
+        particle_pattern = r'(은|는|이|가|을|를|의|에|로|으로|과|와|도|만)$'
         words = query.split()
         keywords = []
-        
         for word in words:
-            # 조사 제거
             clean_word = re.sub(particle_pattern, '', word)
-            
-            # 불용어 제외, 2글자 이상
             if clean_word and len(clean_word) >= 2 and clean_word not in stop_words:
                 keywords.append(clean_word)
-        
-        # 원본 쿼리도 키워드로 추가 (복합어 검색용)
         full_query = query.replace(" ", "")
-        if len(full_query) >= 2:
-            keywords.insert(0, full_query)
-        
+        if len(full_query) >= 1: keywords.insert(0, full_query)
         return keywords
 
     # -------------------------------------------------------
-    # ✅ [NEW] CLIP 이미지 벡터 기반 검색 (시각적 유사도)
+    # 2. ✅ [FIX] CLIP 이미지 벡터 검색 (similarity 반환)
     # -------------------------------------------------------
     async def search_by_clip_vector(
         self, 
@@ -223,238 +260,188 @@ class CRUDProduct:
         exclude_category: Optional[List[str]] = None,
         exclude_id: Optional[List[int]] = None,
         min_price: Optional[int] = None,
-        max_price: Optional[int] = None
+        max_price: Optional[int] = None,
+        target: str = "full",
+        include_category: Optional[List[str]] = None
     ) -> List[Product]:
-        """
-        ✅ CLIP 이미지 벡터(512차원)로 시각적 유사도 검색
-        - 연예인 패션 검색 등 이미지 기반 검색에 사용
-        - embedding_clip 컬럼 사용
-        """
-        import logging
-        logger = logging.getLogger(__name__)
         
+        # 벡터 없으면 빈 결과
         if not clip_vector or len(clip_vector) != 512:
-            logger.warning("❌ Invalid CLIP vector (expected 512 dims)")
             return []
         
+        # [Fix] 타겟에 따른 비교 컬럼 결정
+        target_column = Product.embedding_clip # Default
+        
+        if target == "upper":
+            target_column = Product.embedding_clip_upper
+            logger.info("🎯 Searching against UPPER body vectors")
+        elif target == "lower":
+            target_column = Product.embedding_clip_lower
+            logger.info("🎯 Searching against LOWER body vectors")
+        else:
+            logger.info("🎯 Searching against FULL body vectors")
+
+        # 필터 조건 구성
         conditions = [
             Product.is_active == True,
             Product.deleted_at.is_(None),
-            Product.embedding_clip.is_not(None)
+            target_column.is_not(None) # 해당 컬럼 데이터 존재 필수
         ]
+
+        if include_category:
+            conditions.append(Product.category.in_(include_category))
         
-        # 성별 필터
+        # ✅ [FIX] 성별 필터 로깅 추가
         if filter_gender:
-            conditions.append(
-                or_(
-                    Product.gender == filter_gender,
-                    Product.gender == 'Unisex',
-                    Product.gender.is_(None)
-                )
-            )
+            conditions.append(or_(Product.gender == filter_gender, Product.gender == 'Unisex', Product.gender.is_(None)))
+            logger.info(f"🎯 CLIP search with gender filter: {filter_gender}")
         
-        # 카테고리 제외
         if exclude_category:
-            for cat in exclude_category:
-                conditions.append(Product.category != cat)
+            for cat in exclude_category: conditions.append(Product.category != cat)
+        if exclude_id: conditions.append(Product.id.notin_(exclude_id))
+        if min_price: conditions.append(Product.price >= min_price)
+        if max_price: conditions.append(Product.price <= max_price)
         
-        # ID 제외
-        if exclude_id:
-            conditions.append(Product.id.notin_(exclude_id))
+        # 거리 계산
+        dist = target_column.cosine_distance(clip_vector)
         
-        # 가격 범위
-        if min_price is not None:
-            conditions.append(Product.price >= min_price)
-        if max_price is not None:
-            conditions.append(Product.price <= max_price)
-        
-        # ✅ 코사인 거리 계산 (거리가 작을수록 유사)
-        dist = Product.embedding_clip.cosine_distance(clip_vector)
-        
-        # ✅ SELECT에 거리 포함하여 로깅용
         stmt = select(Product, dist.label('distance')).where(*conditions)
         stmt = stmt.order_by(dist).limit(limit)
         
         result = await db.execute(stmt)
         rows = result.all()
         
-        # ✅ 유사도 점수 상세 로깅
+        # ✅ [FIX] similarity 속성 추가해서 반환
         products = []
-        logger.info("=" * 70)
-        logger.info(f"📊 CLIP 유사도 검색 결과 (상위 {len(rows)}개, 성별필터: {filter_gender})")
-        logger.info("=" * 70)
-        
-        total_similarity = 0
-        for i, row in enumerate(rows):
+        for row in rows:
             product = row[0]
-            distance = float(row[1]) if row[1] is not None else 1.0
-            similarity = 1.0 - distance  # 코사인 유사도 = 1 - 거리
-            total_similarity += similarity
-            
-            # 상품명 truncate
-            name_display = product.name[:25] + "..." if len(product.name) > 25 else product.name
-            
-            logger.info(
-                f"  #{i+1:2d} | ID:{product.id:4d} | {name_display:<28} | "
-                f"거리:{distance:.4f} | 유사도:{similarity:.4f} ({similarity*100:.1f}%) | "
-                f"성별:{product.gender or 'N/A'} | 카테고리:{product.category}"
-            )
-            
+            distance = row[1] if len(row) > 1 else None
+            self._attach_similarity(product, distance)
             products.append(product)
         
-        logger.info("-" * 70)
-        if rows:
-            avg_similarity = total_similarity / len(rows)
-            logger.info(f"📈 평균 유사도: {avg_similarity:.4f} ({avg_similarity*100:.1f}%)")
-            
-            # 유사도가 너무 낮으면 경고
-            if avg_similarity < 0.3:
-                logger.warning(f"⚠️ 평균 유사도가 매우 낮음 ({avg_similarity*100:.1f}%) - CLIP 벡터 품질 확인 필요")
-        logger.info("=" * 70)
-        
+        logger.info(f"✅ CLIP vector search found {len(products)} products")
         return products
 
     # -------------------------------------------------------
-    # 🔧 [UPDATED] 기존 하이브리드 검색 - exclude 파라미터 추가
+    # 3. ✅ [FIX] 기존 검색 메서드 (호환성 유지 + similarity)
     # -------------------------------------------------------
     async def search_hybrid(
         self, 
         db: AsyncSession, 
-        bert_vector: Optional[List[float]] = None,
-        clip_vector: Optional[List[float]] = None,
-        limit: int = 10,
-        filter_gender: Optional[str] = None,
-        min_price: Optional[int] = None,
-        max_price: Optional[int] = None,
-        # ✅ 추가: 제외 파라미터
-        exclude_category: Optional[List[str]] = None,
+        bert_vector: Optional[List[float]] = None, 
+        clip_vector: Optional[List[float]] = None, 
+        limit: int = 10, 
+        filter_gender: Optional[str] = None, 
+        min_price: Optional[int] = None, 
+        max_price: Optional[int] = None, 
+        exclude_category: Optional[List[str]] = None, 
         exclude_id: Optional[List[int]] = None
     ) -> List[Product]:
-        """기존 하이브리드 검색 (호환성 유지) + exclude 파라미터 추가"""
         
-        base_conditions = [
-            Product.is_active == True,
-            Product.deleted_at.is_(None)
-        ]
+        base_conditions = [Product.is_active == True, Product.deleted_at.is_(None)]
         
-        if filter_gender:
-            base_conditions.append(
-                or_(
-                    Product.gender == filter_gender,
-                    Product.gender == 'Unisex',
-                    Product.gender.is_(None)
-                )
-            )
-        if min_price is not None:
-            base_conditions.append(Product.price >= min_price)
-        if max_price is not None:
-            base_conditions.append(Product.price <= max_price)
+        if filter_gender: 
+            base_conditions.append(or_(Product.gender == filter_gender, Product.gender == 'Unisex', Product.gender.is_(None)))
+            logger.info(f"🎯 Hybrid search with gender filter: {filter_gender}")
         
-        # ✅ 추가: 카테고리 제외
+        if min_price: base_conditions.append(Product.price >= min_price)
+        if max_price: base_conditions.append(Product.price <= max_price)
         if exclude_category:
-            for cat in exclude_category:
-                base_conditions.append(Product.category != cat)
-        
-        # ✅ 추가: ID 제외
-        if exclude_id:
-            base_conditions.append(Product.id.notin_(exclude_id))
+            for cat in exclude_category: base_conditions.append(Product.category != cat)
+        if exclude_id: base_conditions.append(Product.id.notin_(exclude_id))
 
-        # BERT 벡터 우선
+        # BERT 벡터 검색
         if bert_vector and len(bert_vector) == 768:
-            stmt = select(Product).where(
-                *base_conditions,
-                Product.embedding.is_not(None)
-            )
             dist = Product.embedding.cosine_distance(bert_vector)
-            stmt = stmt.order_by(dist).limit(limit)
+            stmt = select(Product, dist.label('distance')).where(
+                *base_conditions, 
+                Product.embedding.is_not(None)
+            ).order_by(dist).limit(limit)
             
             result = await db.execute(stmt)
-            results = list(result.scalars().all())
-            if results:
-                return results
-
-        # CLIP 벡터 (512차원)
+            rows = result.all()
+            
+            if rows:
+                products = []
+                for row in rows:
+                    product = row[0]
+                    distance = row[1] if len(row) > 1 else None
+                    self._attach_similarity(product, distance)
+                    products.append(product)
+                return products
+        
+        # CLIP 벡터 검색 Fallback
         if clip_vector and len(clip_vector) == 512:
-            stmt = select(Product).where(
-                *base_conditions,
-                Product.embedding_clip.is_not(None)
-            )
             dist = Product.embedding_clip.cosine_distance(clip_vector)
-            stmt = stmt.order_by(dist).limit(limit)
+            stmt = select(Product, dist.label('distance')).where(
+                *base_conditions, 
+                Product.embedding_clip.is_not(None)
+            ).order_by(dist).limit(limit)
             
             result = await db.execute(stmt)
-            results = list(result.scalars().all())
-            if results:
-                return results
+            rows = result.all()
+            
+            if rows:
+                products = []
+                for row in rows:
+                    product = row[0]
+                    distance = row[1] if len(row) > 1 else None
+                    self._attach_similarity(product, distance)
+                    products.append(product)
+                return products
 
-        # Fallback
-        stmt = select(Product).where(*base_conditions)
-        stmt = stmt.order_by(Product.created_at.desc()).limit(limit)
+        # 최신순 Fallback
+        stmt = select(Product).where(*base_conditions).order_by(Product.created_at.desc()).limit(limit)
         result = await db.execute(stmt)
-        return list(result.scalars().all())
+        products = list(result.scalars().all())
+        
+        # Fallback 결과에는 similarity 없음
+        for p in products:
+            p.similarity = None
+        
+        return products
 
-    # -------------------------------------------------------
-    # 🔧 [UPDATED] 벡터 검색 - filter_gender 파라미터 추가
-    # -------------------------------------------------------
     async def search_by_vector(
         self, 
         db: AsyncSession, 
         query_vector: List[float], 
         limit: int = 10, 
-        exclude_category: Optional[List[str]] = None,
-        exclude_id: Optional[List[int]] = None,
-        min_price: Optional[int] = None,
-        max_price: Optional[int] = None,
-        # ✅ 추가: 성별 필터
-        filter_gender: Optional[str] = None,
+        exclude_category: Optional[List[str]] = None, 
+        exclude_id: Optional[List[int]] = None, 
+        min_price: Optional[int] = None, 
+        max_price: Optional[int] = None, 
+        filter_gender: Optional[str] = None, 
         **kwargs
     ) -> List[Product]:
-        """벡터 기반 검색 (코디 추천용)"""
-        if not query_vector or len(query_vector) == 0:
+        
+        if not query_vector: 
             return await self.get_multi(db, limit=limit)
         
-        conditions = [
-            Product.is_active == True,
-            Product.deleted_at.is_(None),
-            Product.embedding.is_not(None)
-        ]
+        conditions = [Product.is_active == True, Product.deleted_at.is_(None), Product.embedding.is_not(None)]
         
-        # 카테고리 제외
         if exclude_category:
-            for cat in exclude_category:
-                conditions.append(Product.category != cat)
-        
-        # ID 제외
-        if exclude_id:
-            conditions.append(Product.id.notin_(exclude_id))
-        
-        # 가격 범위
-        if min_price is not None:
-            conditions.append(Product.price >= min_price)
-        if max_price is not None:
-            conditions.append(Product.price <= max_price)
-        
-        # ✅ 추가: 성별 필터
-        if filter_gender:
-            conditions.append(
-                or_(
-                    Product.gender == filter_gender,
-                    Product.gender == 'Unisex',
-                    Product.gender.is_(None)
-                )
-            )
-        
-        stmt = select(Product).where(*conditions)
-        
+            for cat in exclude_category: conditions.append(Product.category != cat)
+        if exclude_id: conditions.append(Product.id.notin_(exclude_id))
+        if min_price: conditions.append(Product.price >= min_price)
+        if max_price: conditions.append(Product.price <= max_price)
+        if filter_gender: 
+            conditions.append(or_(Product.gender == filter_gender, Product.gender == 'Unisex', Product.gender.is_(None)))
+
         dist = Product.embedding.cosine_distance(query_vector)
-        stmt = stmt.order_by(dist).limit(limit)
+        stmt = select(Product, dist.label('distance')).where(*conditions).order_by(dist).limit(limit)
         
         result = await db.execute(stmt)
-        return list(result.scalars().all())
-    
-    # -------------------------------------------------------
-    # 키워드 검색
-    # -------------------------------------------------------
+        rows = result.all()
+        
+        products = []
+        for row in rows:
+            product = row[0]
+            distance = row[1] if len(row) > 1 else None
+            self._attach_similarity(product, distance)
+            products.append(product)
+        
+        return products
+
     async def search_keyword(
         self, 
         db: AsyncSession, 
@@ -462,27 +449,29 @@ class CRUDProduct:
         limit: int = 10, 
         filter_gender: Optional[str] = None
     ) -> List[Product]:
-        """키워드 검색"""
+        
         search_pattern = f"%{query}%"
-        stmt = select(Product).where(
-            Product.is_active == True,
-            Product.deleted_at.is_(None),
+        conditions = [
+            Product.is_active == True, 
+            Product.deleted_at.is_(None), 
             or_(
-                Product.name.ilike(search_pattern),
-                Product.description.ilike(search_pattern),
+                Product.name.ilike(search_pattern), 
+                Product.description.ilike(search_pattern), 
                 Product.category.ilike(search_pattern)
             )
-        )
-        if filter_gender:
-            stmt = stmt.where(
-                or_(
-                    Product.gender == filter_gender,
-                    Product.gender == 'Unisex',
-                    Product.gender.is_(None)
-                )
-            )
-        stmt = stmt.order_by(Product.created_at.desc()).limit(limit)
+        ]
+        
+        if filter_gender: 
+            conditions.append(or_(Product.gender == filter_gender, Product.gender == 'Unisex', Product.gender.is_(None)))
+        
+        stmt = select(Product).where(*conditions).order_by(Product.created_at.desc()).limit(limit)
         result = await db.execute(stmt)
-        return list(result.scalars().all())
+        products = list(result.scalars().all())
+        
+        # 키워드 검색은 similarity 없음
+        for p in products:
+            p.similarity = None
+        
+        return products
 
 crud_product = CRUDProduct()

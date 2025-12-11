@@ -1,328 +1,523 @@
-import React, { useState, useRef, useCallback } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { 
-  Upload, FileText, AlertCircle, CheckCircle, Image as ImageIcon, 
-  FileSpreadsheet, X, Loader2, Trash2 
-} from 'lucide-react';
-import client from '@/api/client';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
+import { useDropzone } from 'react-dropzone';
+import { Upload, FileText, CheckCircle2, XCircle, Loader2, ImageIcon, Pause, Play, StopCircle, Trash2, AlertCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import client from '@/api/client';
 
-// --- Types ---
-type UploadMode = 'image' | 'csv';
-
-interface FileQueueItem {
-  id: string;
-  file: File;
-  status: 'idle' | 'processing' | 'success' | 'error';
-  progress: number;
-  resultMsg?: string;
-  errorMsg?: string;
+interface UploadResult {
+  fileName: string;
+  status: 'pending' | 'uploading' | 'success' | 'error' | 'cancelled';
+  message?: string;
+  productId?: number;
 }
 
-// --- Config ---
-const UPLOAD_CONFIG = {
-  image: {
-    title: 'AI 이미지 자동 등록 (Bulk)',
-    desc: '여러 장의 이미지를 드래그하세요. AI가 병렬로 분석하여 상품을 자동 등록합니다.',
-    endpoint: '/products/upload/image-auto', 
-    accept: '.png, .jpg, .jpeg, .webp',
-    label: '이미지 파일 선택 (다중 가능)',
-    icon: <ImageIcon className="w-5 h-5" />,
-    multiple: true
-  },
-  csv: {
-    title: 'CSV 대량 등록',
-    desc: 'CSV 파일을 사용하여 상품을 일괄 등록합니다.',
-    endpoint: '/products/upload/csv',
-    accept: '.csv',
-    label: 'CSV 파일 선택',
-    icon: <FileSpreadsheet className="w-5 h-5" />,
-    multiple: false
-  }
-};
+type UploadMode = 'image' | 'csv';
+type UploadState = 'idle' | 'uploading' | 'paused' | 'completed';
 
 export default function ProductUpload() {
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const [mode, setMode] = useState<UploadMode>('image');
-  const [fileQueue, setFileQueue] = useState<FileQueueItem[]>([]);
-  const [isGlobalProcessing, setIsGlobalProcessing] = useState(false);
-  const [logs, setLogs] = useState<string[]>([]);
+  const [results, setResults] = useState<UploadResult[]>([]);
+  const [logs, setLogs] = useState<string[]>(['Waiting for action...']);
+  const [uploadState, setUploadState] = useState<UploadState>('idle');
+  const [currentIndex, setCurrentIndex] = useState(0);
   
-  const queryClient = useQueryClient();
+  // 파일 큐
+  const [fileQueue, setFileQueue] = useState<File[]>([]);
+  
+  // 일시정지/취소 제어용 ref
+  const isPausedRef = useRef(false);
+  const isCancelledRef = useRef(false);
+  const logEndRef = useRef<HTMLDivElement>(null);
 
-  // --- Helper: Logs ---
-  const addLog = useCallback((log: string) => {
-    setLogs((prev) => {
-      const newLogs = prev.length >= 100 ? prev.slice(1) : prev;
-      return [...newLogs, `[${new Date().toLocaleTimeString()}] ${log}`];
-    });
+  // 삭제 중 상태
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  // 로그 자동 스크롤
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [logs]);
+
+  const addLog = useCallback((msg: string) => {
+    const timestamp = new Date().toLocaleTimeString('ko-KR');
+    setLogs(prev => [...prev, `[${timestamp}] ${msg}`]);
   }, []);
 
-  // --- Helper: Update Item State ---
-  const updateItemStatus = (id: string, updates: Partial<FileQueueItem>) => {
-    setFileQueue(prev => prev.map(item => item.id === id ? { ...item, ...updates } : item));
-  };
+  // =========================================================
+  // 이미지 업로드 처리
+  // =========================================================
+  const processImageQueue = useCallback(async (files: File[], startIndex: number = 0) => {
+    setUploadState('uploading');
+    isPausedRef.current = false;
+    isCancelledRef.current = false;
 
-  // --- Mutation (Single File Upload) ---
-  const uploadMutation = useMutation({
-    mutationFn: async (item: FileQueueItem) => {
-      const formData = new FormData();
-      formData.append('file', item.file);
+    for (let i = startIndex; i < files.length; i++) {
+      // 취소 확인
+      if (isCancelledRef.current) {
+        addLog('⛔ 업로드가 취소되었습니다.');
+        setUploadState('idle');
+        return;
+      }
 
-      const config = UPLOAD_CONFIG[mode];
-      
-      const response = await client.post(config.endpoint, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        onUploadProgress: (progressEvent) => {
-          if (progressEvent.total) {
-            const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-            updateItemStatus(item.id, { progress: percent });
-          }
+      // 일시정지 확인
+      while (isPausedRef.current) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (isCancelledRef.current) {
+          addLog('⛔ 업로드가 취소되었습니다.');
+          setUploadState('idle');
+          return;
         }
-      });
-      return response.data;
+      }
+
+      const file = files[i];
+      setCurrentIndex(i);
+
+      // 상태를 uploading으로 변경
+      setResults(prev => prev.map((r, idx) => 
+        idx === i ? { ...r, status: 'uploading' } : r
+      ));
+
+      addLog(`📤 [${i + 1}/${files.length}] "${file.name}" 업로드 중...`);
+
+      try {
+        const formData = new FormData();
+        formData.append('file', file);
+
+        const response = await client.post('/products/upload/image-auto', formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+          timeout: 60000,
+        });
+
+        setResults(prev => prev.map((r, idx) => 
+          idx === i ? { 
+            ...r, 
+            status: 'success', 
+            message: `상품 ID: ${response.data.id}`,
+            productId: response.data.id 
+          } : r
+        ));
+
+        addLog(`✅ "${file.name}" 업로드 성공! (ID: ${response.data.id})`);
+
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.detail || error.message || '알 수 없는 오류';
+        
+        setResults(prev => prev.map((r, idx) => 
+          idx === i ? { ...r, status: 'error', message: errorMsg } : r
+        ));
+
+        addLog(`❌ "${file.name}" 업로드 실패: ${errorMsg}`);
+      }
     }
+
+    setUploadState('completed');
+    addLog('🎉 모든 파일 처리가 완료되었습니다.');
+  }, [addLog]);
+
+  // =========================================================
+  // Dropzone 설정
+  // =========================================================
+  const onDropImages = useCallback((acceptedFiles: File[]) => {
+    if (acceptedFiles.length === 0) return;
+
+    // 결과 초기화
+    const newResults: UploadResult[] = acceptedFiles.map(file => ({
+      fileName: file.name,
+      status: 'pending'
+    }));
+
+    setResults(newResults);
+    setFileQueue(acceptedFiles);
+    setCurrentIndex(0);
+    setLogs(['📁 파일이 추가되었습니다. "시작" 버튼을 눌러 업로드를 시작하세요.']);
+    setUploadState('idle');
+  }, []);
+
+  const onDropCSV = useCallback(async (acceptedFiles: File[]) => {
+    if (acceptedFiles.length === 0) return;
+
+    const file = acceptedFiles[0];
+    setResults([{ fileName: file.name, status: 'uploading' }]);
+    addLog(`📤 CSV 파일 "${file.name}" 처리 중...`);
+    setUploadState('uploading');
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const response = await client.post('/products/upload/csv', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 120000,
+      });
+
+      const { success, failed, errors } = response.data;
+      
+      setResults([{ 
+        fileName: file.name, 
+        status: failed > 0 ? 'error' : 'success',
+        message: `성공: ${success}건, 실패: ${failed}건`
+      }]);
+
+      addLog(`✅ CSV 처리 완료 - 성공: ${success}건, 실패: ${failed}건`);
+      
+      if (errors && errors.length > 0) {
+        errors.slice(0, 5).forEach((err: string) => addLog(`⚠️ ${err}`));
+      }
+
+    } catch (error: any) {
+      const errorMsg = error.response?.data?.detail || error.message;
+      setResults([{ fileName: file.name, status: 'error', message: errorMsg }]);
+      addLog(`❌ CSV 처리 실패: ${errorMsg}`);
+    }
+
+    setUploadState('completed');
+  }, [addLog]);
+
+  const { getRootProps: getImageRootProps, getInputProps: getImageInputProps, isDragActive: isImageDragActive } = useDropzone({
+    onDrop: onDropImages,
+    accept: { 'image/*': ['.png', '.jpg', '.jpeg', '.webp'] },
+    multiple: true,
+    disabled: uploadState === 'uploading'
   });
 
-  // --- Handlers ---
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0) {
-      const newFiles = Array.from(e.target.files).map(file => ({
-        id: Math.random().toString(36).substring(7),
-        file,
-        status: 'idle' as const,
-        progress: 0
-      }));
+  const { getRootProps: getCSVRootProps, getInputProps: getCSVInputProps, isDragActive: isCSVDragActive } = useDropzone({
+    onDrop: onDropCSV,
+    accept: { 'text/csv': ['.csv'] },
+    multiple: false,
+    disabled: uploadState === 'uploading'
+  });
 
-      if (mode === 'csv') {
-        // CSV는 1개만 허용
-        setFileQueue(newFiles.slice(0, 1));
-      } else {
-        // 이미지는 추가
-        setFileQueue(prev => [...prev, ...newFiles]);
-      }
-      
-      addLog(`📂 Added ${newFiles.length} file(s) to queue.`);
-      // Reset input
-      if (fileInputRef.current) fileInputRef.current.value = '';
+  // =========================================================
+  // 제어 버튼 핸들러
+  // =========================================================
+  const handleStart = () => {
+    if (fileQueue.length === 0) {
+      addLog('⚠️ 업로드할 파일이 없습니다.');
+      return;
     }
+    processImageQueue(fileQueue, currentIndex);
   };
 
-  const removeFile = (id: string) => {
-    setFileQueue(prev => prev.filter(f => f.id !== id));
+  const handlePause = () => {
+    isPausedRef.current = true;
+    setUploadState('paused');
+    addLog('⏸️ 업로드가 일시정지되었습니다.');
   };
 
-  const handleStartUpload = async () => {
-    if (fileQueue.length === 0) return;
-    setIsGlobalProcessing(true);
-    addLog("🚀 Starting Batch Upload...");
+  const handleResume = () => {
+    isPausedRef.current = false;
+    setUploadState('uploading');
+    addLog('▶️ 업로드를 재개합니다.');
+    processImageQueue(fileQueue, currentIndex);
+  };
 
-    // CSV는 단건 처리
-    if (mode === 'csv') {
-      const item = fileQueue[0];
-      if (!item) return;
-      
-      updateItemStatus(item.id, { status: 'processing', progress: 0 });
-      try {
-        const data = await uploadMutation.mutateAsync(item);
-        updateItemStatus(item.id, { status: 'success', resultMsg: `성공: ${data.success}, 실패: ${data.failed}` });
-        addLog(`✅ CSV Upload Complete. Success: ${data.success}`);
-        queryClient.invalidateQueries({ queryKey: ['products'] });
-      } catch (err: any) {
-        updateItemStatus(item.id, { status: 'error', errorMsg: err.message });
-        addLog(`❌ CSV Error: ${err.message}`);
-      }
-      setIsGlobalProcessing(false);
+  const handleCancel = () => {
+    isCancelledRef.current = true;
+    isPausedRef.current = false;
+    
+    // 대기 중인 파일들을 cancelled로 변경
+    setResults(prev => prev.map(r => 
+      r.status === 'pending' || r.status === 'uploading' 
+        ? { ...r, status: 'cancelled', message: '취소됨' } 
+        : r
+    ));
+    
+    setUploadState('idle');
+    addLog('⛔ 업로드가 취소되었습니다.');
+  };
+
+  // =========================================================
+  // 🆕 전체 삭제 (대기열 + 업로드된 상품 모두 삭제)
+  // =========================================================
+  const handleFullDelete = async () => {
+    // 업로드 성공한 상품들의 ID 수집
+    const successProductIds = results
+      .filter(r => r.status === 'success' && r.productId)
+      .map(r => r.productId as number);
+
+    if (successProductIds.length === 0) {
+      // 삭제할 상품이 없으면 대기열만 초기화
+      handleClearQueue();
       return;
     }
 
-    // Image Bulk Processing (Concurrency Control: 3 parallel requests)
-    const PENDING_QUEUE = fileQueue.filter(f => f.status === 'idle' || f.status === 'error');
-    const CONCURRENCY = 3;
-    
-    // Process items in chunks or simplified queue
-    // 단순화를 위해 for...of 로 순차 처리하되, Promise.all로 묶을 수 있음.
-    // 여기서는 안정성을 위해 3개씩 끊어서 처리
-    
-    for (let i = 0; i < PENDING_QUEUE.length; i += CONCURRENCY) {
-      const batch = PENDING_QUEUE.slice(i, i + CONCURRENCY);
-      
-      await Promise.all(batch.map(async (item) => {
-        updateItemStatus(item.id, { status: 'processing', progress: 0 });
-        try {
-          const data = await uploadMutation.mutateAsync(item);
-          updateItemStatus(item.id, { 
-            status: 'success', 
-            progress: 100, 
-            resultMsg: data.name // 상품명 표시
-          });
-          addLog(`✅ Uploaded: ${item.file.name} -> ${data.name}`);
-        } catch (err: any) {
-          const errMsg = err.response?.data?.detail || "Upload failed";
-          updateItemStatus(item.id, { status: 'error', errorMsg: errMsg });
-          addLog(`❌ Failed: ${item.file.name} - ${errMsg}`);
-        }
-      }));
-    }
+    // 삭제 확인
+    const confirmDelete = window.confirm(
+      `업로드된 ${successProductIds.length}개 상품을 DB와 이미지에서 완전히 삭제하시겠습니까?\n\n⚠️ 이 작업은 되돌릴 수 없습니다.`
+    );
 
-    queryClient.invalidateQueries({ queryKey: ['products'] });
-    setIsGlobalProcessing(false);
-    addLog("✨ All tasks finished.");
+    if (!confirmDelete) return;
+
+    setIsDeleting(true);
+    addLog(`🗑️ ${successProductIds.length}개 상품 삭제 시작...`);
+
+    try {
+      const response = await client.post('/products/bulk-delete', {
+        product_ids: successProductIds
+      });
+
+      const { deleted_count, image_deleted_count, errors } = response.data;
+
+      addLog(`✅ 삭제 완료: ${deleted_count}개 상품, ${image_deleted_count}개 이미지`);
+      
+      if (errors && errors.length > 0) {
+        errors.forEach((err: string) => addLog(`⚠️ ${err}`));
+      }
+
+      // 대기열 초기화
+      handleClearQueue();
+
+    } catch (error: any) {
+      const errorMsg = error.response?.data?.detail || error.message || '삭제 실패';
+      addLog(`❌ 삭제 실패: ${errorMsg}`);
+    } finally {
+      setIsDeleting(false);
+    }
   };
 
-  const currentConfig = UPLOAD_CONFIG[mode];
+  // =========================================================
+  // 대기열만 초기화 (기존 기능)
+  // =========================================================
+  const handleClearQueue = () => {
+    setResults([]);
+    setFileQueue([]);
+    setCurrentIndex(0);
+    setUploadState('idle');
+    isPausedRef.current = false;
+    isCancelledRef.current = false;
+    setLogs(['🔄 대기열이 초기화되었습니다.']);
+  };
+
+  // 진행률 계산
+  const completedCount = results.filter(r => r.status === 'success' || r.status === 'error' || r.status === 'cancelled').length;
+  const progress = results.length > 0 ? Math.round((completedCount / results.length) * 100) : 0;
+
+  // 업로드 성공한 상품 개수
+  const successCount = results.filter(r => r.status === 'success').length;
+
+  // 상태 아이콘 컴포넌트
+  const StatusIcon = ({ status }: { status: UploadResult['status'] }) => {
+    switch (status) {
+      case 'success': return <CheckCircle2 className="text-green-500" size={18} />;
+      case 'error': return <XCircle className="text-red-500" size={18} />;
+      case 'uploading': return <Loader2 className="text-purple-500 animate-spin" size={18} />;
+      case 'cancelled': return <AlertCircle className="text-orange-500" size={18} />;
+      default: return <div className="w-4 h-4 rounded-full border-2 border-gray-300" />;
+    }
+  };
 
   return (
-    <div className="p-6 max-w-6xl mx-auto">
+    <div className="p-6 max-w-5xl mx-auto">
+      {/* 뒤로가기 버튼 */}
+      <button 
+        onClick={() => window.history.back()}
+        className="flex items-center gap-2 text-gray-500 hover:text-purple-600 mb-4 transition-colors"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+        뒤로가기
+      </button>
+      
       <h1 className="text-3xl font-bold text-gray-900 dark:text-white mb-2">상품 업로드 관리</h1>
       <p className="text-gray-500 mb-6">AI 자동 등록 또는 CSV 대량 등록을 선택하세요.</p>
 
-      {/* 1. Mode Tabs */}
-      <div className="flex space-x-4 mb-6">
-        {(Object.keys(UPLOAD_CONFIG) as UploadMode[]).map((tabKey) => (
-          <button
-            key={tabKey}
-            onClick={() => { setMode(tabKey); setFileQueue([]); setLogs([]); }}
-            className={`flex items-center space-x-2 px-6 py-3 rounded-xl font-bold transition-all ${
-              mode === tabKey 
-                ? 'bg-purple-600 text-white shadow-lg shadow-purple-200 dark:shadow-none' 
-                : 'bg-white dark:bg-gray-800 text-gray-500 hover:bg-gray-50 dark:hover:bg-gray-700'
-            }`}
-          >
-            {UPLOAD_CONFIG[tabKey].icon}
-            <span>{UPLOAD_CONFIG[tabKey].title}</span>
-          </button>
-        ))}
+      {/* 모드 선택 탭 */}
+      <div className="flex gap-2 mb-6">
+        <Button
+          variant={mode === 'image' ? 'default' : 'outline'}
+          onClick={() => { setMode('image'); handleClearQueue(); }}
+          className="flex items-center gap-2"
+          disabled={uploadState === 'uploading' || isDeleting}
+        >
+          <ImageIcon size={18} /> AI 이미지 자동 등록 (Bulk)
+        </Button>
+        <Button
+          variant={mode === 'csv' ? 'default' : 'outline'}
+          onClick={() => { setMode('csv'); handleClearQueue(); }}
+          className="flex items-center gap-2"
+          disabled={uploadState === 'uploading' || isDeleting}
+        >
+          <FileText size={18} /> CSV 대량 등록
+        </Button>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* 2. Upload Area & Queue (Left/Center) */}
-        <div className="lg:col-span-2 space-y-6">
-            
-          {/* Drop Zone */}
-          <div className="bg-white dark:bg-gray-800 p-6 rounded-3xl shadow-sm border border-gray-100 dark:border-gray-700">
-            <h3 className="text-lg font-semibold text-gray-900 dark:text-white flex items-center gap-2 mb-4">
-              {currentConfig.icon} {currentConfig.title}
-            </h3>
-            
-            <div 
-              className={`border-2 border-dashed rounded-2xl p-8 flex flex-col items-center justify-center transition-colors min-h-[200px]
-                ${isGlobalProcessing ? 'bg-gray-50 dark:bg-gray-900 border-gray-300 cursor-not-allowed' : 'border-gray-300 dark:border-gray-600 hover:border-purple-500 cursor-pointer'}
-              `}
-              onClick={() => !isGlobalProcessing && fileInputRef.current?.click()}
-            >
-              <input 
-                type="file" 
-                multiple={currentConfig.multiple}
-                accept={currentConfig.accept} 
-                ref={fileInputRef} 
-                className="hidden" 
-                onChange={handleFileSelect}
-                disabled={isGlobalProcessing}
-              />
-              <Upload className="w-12 h-12 text-gray-400 mb-4" />
-              <p className="text-gray-600 dark:text-gray-300 font-medium mb-1">
-                {isGlobalProcessing ? '처리 중입니다...' : '파일을 클릭하거나 여기로 드래그하세요'}
-              </p>
-              <p className="text-xs text-gray-400">{currentConfig.accept} 지원</p>
-            </div>
-          </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* 왼쪽: 업로드 영역 */}
+        <div className="space-y-4">
+          {mode === 'image' ? (
+            <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+              <h2 className="font-bold text-lg mb-4 flex items-center gap-2">
+                <ImageIcon className="text-purple-500" /> AI 이미지 자동 등록 (Bulk)
+              </h2>
 
-          {/* File Queue List */}
-          {fileQueue.length > 0 && (
-            <div className="bg-white dark:bg-gray-800 p-6 rounded-3xl shadow-sm border border-gray-100 dark:border-gray-700">
-              <div className="flex justify-between items-center mb-4">
-                <h4 className="font-bold text-gray-800 dark:text-white">
-                  대기열 ({fileQueue.length}개)
-                </h4>
-                <div className="flex gap-2">
-                    <Button 
-                        variant="ghost" 
-                        size="sm" 
-                        onClick={() => setFileQueue([])} 
-                        disabled={isGlobalProcessing}
-                        className="text-red-500 hover:text-red-600 hover:bg-red-50"
-                    >
-                        전체 삭제
-                    </Button>
-                    <Button 
-                        onClick={handleStartUpload} 
-                        disabled={isGlobalProcessing || fileQueue.every(f => f.status === 'success')}
-                        className="bg-purple-600 hover:bg-purple-700 text-white"
-                    >
-                        {isGlobalProcessing ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
-                        {isGlobalProcessing ? '처리 중...' : '일괄 등록 시작'}
-                    </Button>
-                </div>
+              {/* Dropzone */}
+              <div
+                {...getImageRootProps()}
+                className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-colors
+                  ${isImageDragActive ? 'border-purple-500 bg-purple-50 dark:bg-purple-900/20' : 'border-gray-300 hover:border-purple-400'}
+                  ${uploadState === 'uploading' || isDeleting ? 'opacity-50 cursor-not-allowed' : ''}`}
+              >
+                <input {...getImageInputProps()} />
+                <Upload className="w-12 h-12 mx-auto text-gray-400 mb-3" />
+                <p className="text-gray-600 dark:text-gray-300">파일을 클릭하거나 여기로 드래그하세요</p>
+                <p className="text-sm text-gray-400 mt-1">.png, .jpg, .jpeg, .webp 지원</p>
               </div>
 
-              <div className="space-y-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
-                {fileQueue.map((item) => (
-                  <div key={item.id} className="flex items-center gap-4 p-3 bg-gray-50 dark:bg-gray-900/50 rounded-xl border border-gray-100 dark:border-gray-700">
-                    {/* Icon Status */}
-                    <div className="flex-shrink-0">
-                        {item.status === 'idle' && <div className="w-8 h-8 rounded-full bg-gray-200 flex items-center justify-center text-gray-500"><FileText size={16}/></div>}
-                        {item.status === 'processing' && <Loader2 className="w-8 h-8 text-purple-600 animate-spin" />}
-                        {item.status === 'success' && <div className="w-8 h-8 rounded-full bg-green-100 flex items-center justify-center text-green-600"><CheckCircle size={16}/></div>}
-                        {item.status === 'error' && <div className="w-8 h-8 rounded-full bg-red-100 flex items-center justify-center text-red-600"><AlertCircle size={16}/></div>}
-                    </div>
-
-                    {/* Info */}
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{item.file.name}</p>
-                      <div className="flex items-center gap-2 mt-1">
-                        {item.status === 'processing' && (
-                            <div className="w-full bg-gray-200 rounded-full h-1.5 dark:bg-gray-700 max-w-[150px]">
-                                <div className="bg-purple-600 h-1.5 rounded-full transition-all" style={{ width: `${item.progress}%` }}></div>
-                            </div>
-                        )}
-                        <p className={`text-xs ${
-                            item.status === 'error' ? 'text-red-500' : 
-                            item.status === 'success' ? 'text-green-500' : 'text-gray-500'
-                        }`}>
-                            {item.status === 'idle' ? '대기 중' : 
-                             item.status === 'processing' ? 'AI 분석 중...' :
-                             item.status === 'success' ? (item.resultMsg || '완료') : 
-                             (item.errorMsg || '실패')}
-                        </p>
-                      </div>
-                    </div>
-
-                    {/* Action */}
-                    {item.status === 'idle' || item.status === 'error' ? (
-                        <button 
-                            onClick={() => removeFile(item.id)} 
-                            disabled={isGlobalProcessing}
-                            className="p-2 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-full text-gray-400 hover:text-red-500 transition-colors"
+              {/* 제어 버튼 */}
+              {fileQueue.length > 0 && (
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {uploadState === 'idle' && (
+                    <Button onClick={handleStart} className="flex items-center gap-2 bg-green-600 hover:bg-green-700" disabled={isDeleting}>
+                      <Play size={16} /> 시작
+                    </Button>
+                  )}
+                  
+                  {uploadState === 'uploading' && (
+                    <Button onClick={handlePause} variant="outline" className="flex items-center gap-2">
+                      <Pause size={16} /> 일시정지
+                    </Button>
+                  )}
+                  
+                  {uploadState === 'paused' && (
+                    <>
+                      <Button onClick={handleResume} className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700">
+                        <Play size={16} /> 이어하기
+                      </Button>
+                      <Button onClick={handleCancel} variant="destructive" className="flex items-center gap-2">
+                        <StopCircle size={16} /> 업로드 취소
+                      </Button>
+                    </>
+                  )}
+                  
+                  {uploadState === 'uploading' && (
+                    <Button onClick={handleCancel} variant="destructive" className="flex items-center gap-2">
+                      <StopCircle size={16} /> 취소
+                    </Button>
+                  )}
+                  
+                  {/* 🆕 전체 삭제 버튼 (업로드된 상품 + 대기열 모두 삭제) */}
+                  {(uploadState === 'idle' || uploadState === 'completed' || uploadState === 'paused') && (
+                    <>
+                      <Button onClick={handleClearQueue} variant="outline" className="flex items-center gap-2" disabled={isDeleting}>
+                        <Trash2 size={16} /> 대기열 초기화
+                      </Button>
+                      
+                      {successCount > 0 && (
+                        <Button 
+                          onClick={handleFullDelete} 
+                          variant="destructive" 
+                          className="flex items-center gap-2"
+                          disabled={isDeleting}
                         >
+                          {isDeleting ? (
+                            <Loader2 size={16} className="animate-spin" />
+                          ) : (
                             <Trash2 size={16} />
-                        </button>
-                    ) : null}
+                          )}
+                          {isDeleting ? '삭제 중...' : `전체 삭제 (${successCount}개 상품)`}
+                        </Button>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* 진행률 바 */}
+              {results.length > 0 && (
+                <div className="mt-4">
+                  <div className="flex justify-between text-sm text-gray-500 mb-1">
+                    <span>진행률</span>
+                    <span>{completedCount} / {results.length} ({progress}%)</span>
                   </div>
-                ))}
+                  <div className="w-full bg-gray-200 rounded-full h-2">
+                    <div 
+                      className="bg-purple-600 h-2 rounded-full transition-all duration-300"
+                      style={{ width: `${progress}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* 결과 목록 */}
+              {results.length > 0 && (
+                <div className="mt-4 max-h-[300px] overflow-y-auto space-y-2">
+                  {results.map((result, index) => (
+                    <div 
+                      key={index} 
+                      className={`flex items-center justify-between p-3 rounded-lg border
+                        ${result.status === 'uploading' ? 'bg-purple-50 dark:bg-purple-900/20 border-purple-200' : ''}
+                        ${result.status === 'success' ? 'bg-green-50 dark:bg-green-900/20 border-green-200' : ''}
+                        ${result.status === 'error' ? 'bg-red-50 dark:bg-red-900/20 border-red-200' : ''}
+                        ${result.status === 'cancelled' ? 'bg-orange-50 dark:bg-orange-900/20 border-orange-200' : ''}
+                        ${result.status === 'pending' ? 'bg-gray-50 dark:bg-gray-800 border-gray-200' : ''}`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <StatusIcon status={result.status} />
+                        <span className="text-sm font-medium truncate max-w-[200px]">{result.fileName}</span>
+                      </div>
+                      <span className="text-xs text-gray-500">{result.message}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-6">
+              <h2 className="font-bold text-lg mb-4 flex items-center gap-2">
+                <FileText className="text-purple-500" /> CSV 대량 등록
+              </h2>
+
+              <div
+                {...getCSVRootProps()}
+                className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-colors
+                  ${isCSVDragActive ? 'border-purple-500 bg-purple-50 dark:bg-purple-900/20' : 'border-gray-300 hover:border-purple-400'}
+                  ${uploadState === 'uploading' ? 'opacity-50 cursor-not-allowed' : ''}`}
+              >
+                <input {...getCSVInputProps()} />
+                <FileText className="w-12 h-12 mx-auto text-gray-400 mb-3" />
+                <p className="text-gray-600 dark:text-gray-300">CSV 파일을 드래그하거나 클릭하세요</p>
+                <p className="text-sm text-gray-400 mt-1">필수 컬럼: name, category, price</p>
               </div>
+
+              {results.length > 0 && (
+                <div className="mt-4 space-y-2">
+                  {results.map((result, index) => (
+                    <div key={index} className={`flex items-center justify-between p-3 rounded-lg border
+                      ${result.status === 'success' ? 'bg-green-50 border-green-200' : ''}
+                      ${result.status === 'error' ? 'bg-red-50 border-red-200' : ''}
+                      ${result.status === 'uploading' ? 'bg-purple-50 border-purple-200' : ''}`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <StatusIcon status={result.status} />
+                        <span className="text-sm font-medium">{result.fileName}</span>
+                      </div>
+                      <span className="text-xs text-gray-500">{result.message}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
 
-        {/* 3. Log Area (Right) */}
-        <div className="lg:col-span-1">
-          <div className="bg-black text-green-400 p-6 rounded-3xl font-mono text-xs h-full min-h-[400px] overflow-hidden flex flex-col shadow-xl border border-gray-800">
-            <div className="flex items-center gap-2 border-b border-gray-800 pb-3 mb-3 text-gray-400">
-              <FileText size={14} />
-              <span className="font-bold tracking-wider">SYSTEM_LOGS</span>
+        {/* 오른쪽: 시스템 로그 */}
+        <div className="bg-gray-900 rounded-2xl p-4 text-green-400 font-mono text-sm">
+          <div className="flex items-center justify-between mb-3 text-gray-400">
+            <div className="flex items-center gap-2">
+              <div className="w-3 h-3 rounded-full bg-red-500" />
+              <div className="w-3 h-3 rounded-full bg-yellow-500" />
+              <div className="w-3 h-3 rounded-full bg-green-500" />
+              <span className="ml-2">SYSTEM_LOGS</span>
             </div>
-            <div className="flex-1 overflow-y-auto space-y-1 custom-scrollbar">
-               {logs.length === 0 ? (
-                    <span className="text-gray-700 animate-pulse">Waiting for action...</span>
-                ) : (
-                    logs.map((log, i) => <div key={i} className="break-all hover:bg-gray-900/50 p-1 rounded border-l-2 border-transparent hover:border-green-500 transition-all">{log}</div>)
-                )}
-                <div ref={useCallback((node: HTMLDivElement | null) => { if (node) node.scrollIntoView({ behavior: 'smooth' }); }, [logs])} />
-            </div>
+            <span>{logs.length} logs</span>
+          </div>
+          
+          {/* 고정 높이 + 스크롤 */}
+          <div className="h-[350px] overflow-y-auto space-y-1">
+            {logs.map((log, i) => (
+              <div key={i} className="whitespace-pre-wrap break-words">{log}</div>
+            ))}
+            <div ref={logEndRef} />
           </div>
         </div>
-
       </div>
     </div>
   );

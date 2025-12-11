@@ -14,7 +14,7 @@ class ProductBase(BaseModel):
 class ProductCreate(ProductBase):
     gender: Optional[str] = Field(None, examples=["Unisex"])
     embedding: Optional[List[float]] = None        # BERT 벡터 (768차원)
-    embedding_clip: Optional[List[float]] = None   # CLIP 벡터 (512차원) - 신규 추가
+    embedding_clip: Optional[List[float]] = None   # CLIP 벡터 (512차원) 
 
 class ProductUpdate(ProductBase):
     name: Optional[str] = None
@@ -30,7 +30,10 @@ class ProductResponse(ProductBase):
     created_at: datetime
     updated_at: datetime
     
-    # [FIX] DB 컬럼이 아닌 계산된 필드로 변경하여 에러 방지
+    # 검색 유사도 점수 (0.0 ~ 1.0, 높을수록 유사)
+    similarity: Optional[float] = Field(None, description="검색 유사도 점수 (0.0~1.0)")
+    
+    # DB 컬럼이 아닌 계산된 필드로 변경하여 에러 방지
     @computed_field
     def in_stock(self) -> bool:
         return self.stock_quantity > 0

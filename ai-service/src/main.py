@@ -2,6 +2,9 @@ import logging
 import json
 import re
 import base64
+import os
+import uuid
+import traceback
 from fastapi import FastAPI, HTTPException, APIRouter, UploadFile, File
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -44,9 +47,10 @@ class ImageAnalysisResponse(BaseModel):
     gender: str
     description: str
     price: int
-    vector: List[float]           # BERT 벡터 (768차원)
-    vector_clip: List[float]      # CLIP 벡터 (512차원) - 신규 추가
-
+    vector: List[float]           # BERT (768)
+    vector_clip: List[float]      # CLIP Full (512)
+    vector_clip_upper: List[float] # CLIP Upper (512)
+    vector_clip_lower: List[float] # CLIP Lower (512)
 class PathRequest(BaseModel):
     query: str
 
@@ -100,6 +104,36 @@ def _extract_from_text(text: str, key_patterns: List[str], default: str = "") ->
             return _fix_encoding(clean_val)
     return default
 
+CATEGORY_MAP = {
+    # AI가 뱉을 수 있는 한글 -> DB에 저장할 영어 표준
+    "상의": "Tops",
+    "티셔츠": "Tops",
+    "니트": "Tops",
+    "셔츠": "Tops",
+    
+    "하의": "Bottoms",
+    "바지": "Bottoms",
+    "치마": "Bottoms",
+    "스커트": "Bottoms",
+    "팬츠": "Bottoms",
+    "진": "Bottoms",
+    
+    "아우터": "Outerwear",
+    "자켓": "Outerwear",
+    "코트": "Outerwear",
+    "패딩": "Outerwear",
+    
+    "원피스": "Dresses",
+    "드레스": "Dresses",
+    
+    "신발": "Shoes",
+    "슈즈": "Shoes",
+    
+    "액세서리": "Accessories",
+    "모자": "Accessories",
+    "가방": "Accessories"
+}
+
 # --- Endpoints (기존 기능 유지) ---
 
 @api_router.post("/embed-text", response_model=EmbedResponse)
@@ -112,138 +146,101 @@ async def embed_text(request: EmbedRequest):
 
 @api_router.post("/analyze-image", response_model=ImageAnalysisResponse)
 async def analyze_image(file: UploadFile = File(...)):
-    """
-    이미지 분석 및 상품 정보 생성
-    - BERT 벡터 (768차원): 텍스트 기반 검색용
-    - CLIP 벡터 (512차원): 이미지 기반 시각적 유사도 검색용
-    """
     filename = file.filename
     try:
         contents = await file.read()
         image_b64 = base64.b64encode(contents).decode("utf-8")
         
-        prompt = VISION_ANALYSIS_PROMPT
-        
         logger.info(f"👁️ Analyzing image: {filename}...")
-        generated_text = model_engine.generate_with_image(prompt, image_b64)
         
-        # [Critical] 1차 인코딩 보정
-        generated_text = _fix_encoding(generated_text)
-        logger.info(f"🤖 Raw AI Response: {generated_text}")
-
-        if "cannot assist" in generated_text or "I cannot" in generated_text:
-            raise ValueError("AI Safety Filter Triggered")
-
-        product_data = {}
-        parsing_success = False
-
-        # JSON 파싱 시도
+        # 1. Text Generation (Llama)
+        generated_text = model_engine.generate_with_image(VISION_ANALYSIS_PROMPT, image_b64)
+        
+        # JSON Parsing (이미 model_engine 내부에서 인코딩/파싱 처리됨)
         try:
-            json_match = re.search(r"\{[\s\S]*\}", generated_text)
-            if json_match:
-                clean_json = json_match.group()
-                clean_json = re.sub(r"```json|```", "", clean_json)
-                product_data = json.loads(clean_json)
-                parsing_success = True
-            else:
-                product_data = json.loads(generated_text)
-                parsing_success = True
-        except Exception as e:
-            logger.warning(f"⚠️ JSON Parsing failed: {e}. Attempting Fallback Regex...")
-
-        # Fallback Parser
-        if not parsing_success:
-            logger.info("🔧 Running Fallback Parser...")
-            product_data["name"] = _extract_from_text(generated_text, [r'"?name"?\s*:\s*"([^"]+)"', r'"?이름"?\s*:\s*"([^"]+)"', r'Name:\s*(.+)'])
-            product_data["category"] = _extract_from_text(generated_text, [r'"?category"?\s*:\s*"([^"]+)"', r'"?카테고리"?\s*:\s*"([^"]+)"', r'Category:\s*(.+)'], "Uncategorized")
-            product_data["gender"] = _extract_from_text(generated_text, [r'"?gender"?\s*:\s*"([^"]+)"', r'"?성별"?\s*:\s*"([^"]+)"', r'Gender:\s*(.+)'], "Unisex")
-            product_data["description"] = _extract_from_text(generated_text, [r'"?description"?\s*:\s*"([^"]+)"', r'"?설명"?\s*:\s*"([^"]+)"', r'Description:\s*(.+)'], "AI 상세 분석 내용입니다.")
-            price_str = _extract_from_text(generated_text, [r'"?price"?\s*:\s*([\d,]+)', r'"?가격"?\s*:\s*([\d,]+)', r'Price:\s*([\d,]+)'], "0")
-            try:
-                product_data["price"] = int(re.sub(r"[^0-9]", "", price_str))
-            except:
-                product_data["price"] = 0
-
-        # 데이터 정규화 및 벡터 생성
-        final_name = _fix_encoding(product_data.get("name"))
-        if not final_name or "상품명" in final_name or "JSON" in final_name:
-             final_name = f"AI 추천 상품 ({filename.split('.')[0]})"
-        
-        final_desc = _fix_encoding(product_data.get("description"))
-        if not final_desc or len(final_desc) < 5:
-            final_desc = "AI가 이미지를 분석하여 추천하는 상품입니다."
-
-        final_cat = _fix_encoding(product_data.get("category", "Uncategorized"))
-        
-        raw_gender = str(product_data.get("gender", "Unisex"))
-        if any(x in raw_gender.lower() for x in ['wo', 'female', 'girl', 'lady', '여성', '여자']):
-            final_gender = 'Female'
-        elif any(x in raw_gender.lower() for x in ['man', 'male', 'boy', '남성', '남자']):
-            final_gender = 'Male'
-        else:
-            final_gender = 'Unisex'
-
-        try:
-            raw_price = str(product_data.get("price", 0))
-            price = int(re.sub(r"[^0-9]", "", raw_price))
+            product_data = json.loads(generated_text)
         except:
-            price = 0
+            product_data = {
+                "name": f"상품 {filename}", 
+                "category": "Fashion", 
+                "price": 0, 
+                "gender": "Unisex", 
+                "description": generated_text[:200]
+            }
 
-        # ============================================================
-        # [BERT 벡터] 텍스트 기반 임베딩 (768차원)
-        # ============================================================
-        meta_text = f"[{final_gender}] {final_name} {final_cat} {final_desc}"
-        vector = model_engine.generate_embedding(meta_text)
+        # ---------------------------------------------------------
+        # 한글 카테고리를 영어 표준(Enum)으로 변환
+        # ---------------------------------------------------------
+        raw_category = product_data.get("category", "Etc") # AI가 준 값 (예: "아우터")
+        
+        # 1. 매핑 테이블에서 찾기
+        standard_category = CATEGORY_MAP.get(raw_category)
+        
+        # 2. 못 찾았다면, 혹시 키워드가 포함되어 있는지 확인 (유연성 확보)
+        if not standard_category:
+            for kr_key, en_val in CATEGORY_MAP.items():
+                if kr_key in raw_category: # 예: "멋진 아우터" -> "Outerwear"
+                    standard_category = en_val
+                    break
+        
+        # 3. 그래도 없으면 기본값 혹은 원본 사용 (단, 원본이 영어일 수도 있으니)
+        final_category = standard_category if standard_category else "Etc"
+        
+        # 변환된 카테고리를 덮어씌움
+        product_data["category"] = final_category
+        
+        logger.info(f"🔄 Category Mapped: '{raw_category}' -> '{final_category}'")
+        # ---------------------------------------------------------    
 
-        # ============================================================
-        # [CLIP 벡터] 이미지 기반 시각적 임베딩 (512차원) - 신규 추가!
-        # ============================================================
-        vector_clip = []
-        try:
-            clip_result = model_engine.generate_image_embedding(image_b64)
-            vector_clip = clip_result.get("clip", [])
-            if vector_clip:
-                logger.info(f"🖼️ CLIP vector generated: {len(vector_clip)} dimensions")
-            else:
-                logger.warning("⚠️ CLIP vector empty, using zeros")
-                vector_clip = [0.0] * 512
-        except Exception as e:
-            logger.error(f"❌ CLIP vector generation failed: {e}")
-            vector_clip = [0.0] * 512
-
-        logger.info(f"✅ Analysis Success: {final_name} ({final_gender}) - {price}원")
-        logger.info(f"   📊 BERT: {len(vector)}dim, CLIP: {len(vector_clip)}dim")
-
+        # 2. Vector Generation (BERT + CLIP Full/Upper/Lower)
+        # BERT (768)
+        meta_text = f"[{product_data.get('gender')}] {product_data.get('name')} {product_data.get('category')}"
+        vector_bert = model_engine.generate_embedding(meta_text)
+        
+        # CLIP (512 x 3) - Optimized & Zero-padded safe
+        fashion_vectors = model_engine.generate_fashion_embeddings(image_b64)
+        
+        logger.info(f"✅ Analysis Success: {product_data.get('name')}")
+        
         return {
-            "name": final_name,
-            "category": final_cat,
-            "gender": final_gender,
-            "description": final_desc,
-            "price": price,
-            "vector": vector,           # BERT 768차원
-            "vector_clip": vector_clip  # CLIP 512차원
+            "name": product_data.get("name", "Unknown"),
+            "category": product_data.get("category", "Etc"),
+            "gender": product_data.get("gender", "Unisex"),
+            "description": product_data.get("description", ""),
+            "price": product_data.get("price", 0),
+            "vector": vector_bert,
+            "vector_clip": fashion_vectors["full"],
+            "vector_clip_upper": fashion_vectors["upper"],
+            "vector_clip_lower": fashion_vectors["lower"]
         }
 
     except Exception as e:
         logger.error(f"❌ Analysis Critical Error: {e}")
+        # Error Fallback (DB Insert를 위해 모든 벡터 0 채움)
+        zero_512 = [0.0] * 512
         return {
-            "name": f"등록된 상품 ({filename})",
-            "category": "Etc",
+            "name": f"ErrorItem ({filename})",
+            "category": "Error",
             "gender": "Unisex",
-            "description": "이미지 분석 실패.",
+            "description": "분석 실패",
             "price": 0,
             "vector": [0.0] * 768,
-            "vector_clip": [0.0] * 512
+            "vector_clip": zero_512,
+            "vector_clip_upper": zero_512,
+            "vector_clip_lower": zero_512
         }
 
 @api_router.post("/llm-generate-response")
 async def llm_generate(body: Dict[str, str]):
     prompt = body.get("prompt", "")
+    logger.info(f"📝 LLM Prompt received: {prompt[:100]}...")
     try:
         korean_prompt = f"질문: {prompt}\n답변 (한국어):"
         answer = model_engine.generate_text(korean_prompt)
         return {"answer": answer}
-    except:
+    except Exception as e:
+        logger.error(f"❌ LLM Generation Failed: {e}")
+        logger.error(traceback.format_exc())
         return {"answer": "죄송합니다. AI 응답을 생성할 수 없습니다."}
     
 @api_router.post("/analyze-image-detail")
@@ -330,6 +327,15 @@ async def generate_fashion_clip_vector(request: FashionClipRequest):
             if cropped is not None:
                 logger.info(f"✂️ YOLO cropped '{target}' region: {cropped.size}")
                 pil_image = cropped
+
+                # ✅ [DEBUG] 크롭된 이미지가 맞는지 눈으로 확인하기 위해 저장!
+                debug_dir = "/app/static/debug" # 도커 볼륨 경로 확인 필요 (혹은 "./debug_images")
+                os.makedirs(debug_dir, exist_ok=True)
+                debug_filename = f"{debug_dir}/{uuid.uuid4()}_{target}.jpg"
+                pil_image.save(debug_filename)
+                logger.info(f"📸 Debug Image Saved: {debug_filename}")
+
+
             else:
                 logger.warning(f"⚠️ YOLO crop failed for '{target}', using original")
                 

@@ -1,4 +1,4 @@
-
+version: '3.9'
 
 services:
   # 1. Database (PostgreSQL with pgvector)
@@ -118,7 +118,7 @@ services:
       dockerfile: Dockerfile
     container_name: modify-ai-worker
     restart: always
-    command: celery -A src.worker.celery_app worker --loglevel=info --concurrency=2
+    command: /opt/venv/bin/celery -A src.worker.celery_app worker --loglevel=info --concurrency=2
     # [수정됨] 루트 파일이 아니라, ai-service 폴더 안의 설정 파일을 읽도록 변경
     env_file:
       - ./ai-service/.env.dev

@@ -11,12 +11,17 @@ import ProductDetail from '@/pages/ProductDetail';
 import Profile from '@/pages/Profile';
 import Settings from '@/pages/Settings';
 
-// ✅ 추가: 장바구니 & 결제 페이지
+// ✅ 장바구니 & 결제 페이지
 import Cart from '@/pages/Cart';
 import Checkout from '@/pages/Checkout';
 
+// ✅ 관리자 페이지
 import Dashboard from '@/pages/admin/Dashboard';
 import ProductUpload from '@/pages/admin/ProductUpload';
+import CustomerManagement from '@/pages/admin/CustomerManagement';
+import ProductManagement from '@/pages/admin/ProductManagement';
+import SalesManagement from '@/pages/admin/SalesManagement';
+
 import AdminRoute from '@/components/routes/AdminRoute'; 
 
 const queryClient = new QueryClient({
@@ -49,14 +54,17 @@ export default function App() {
               <Route path="/search" element={<Search />} />
               <Route path="/products/:id" element={<ProductDetail />} />
               
-              {/* ✅ 추가: 장바구니 & 결제 라우트 */}
+              {/* 장바구니 & 결제 라우트 */}
               <Route path="/cart" element={<Cart />} />
               <Route path="/checkout" element={<Checkout />} />
               
-              {/* 관리자 라우트 */}
+              {/* ✅ 관리자 라우트 */}
               <Route element={<AdminRoute />}> 
                 <Route path="/admin" element={<Dashboard />} />
                 <Route path="/admin/upload" element={<ProductUpload />} />
+                <Route path="/admin/customers" element={<CustomerManagement />} />
+                <Route path="/admin/products" element={<ProductManagement />} />
+                <Route path="/admin/sales" element={<SalesManagement />} />
               </Route>
             </Route>
             

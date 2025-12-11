@@ -11,6 +11,15 @@ import client from '../api/client';
 import ProductCard from '../components/product/ProductCard';
 import Modal from '../components/ui/Modal';
 
+// ✅ 이미지 URL 변환 유틸리티
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const getImageUrl = (imageUrl: string | null | undefined): string => {
+    if (!imageUrl) return 'https://placehold.co/400x500/e2e8f0/64748b?text=No+Image';
+    if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) return imageUrl;
+    if (imageUrl.startsWith('/static/')) return `${API_BASE_URL}${imageUrl}`;
+    return `${API_BASE_URL}/${imageUrl}`;
+};
+
 // --- Types ---
 interface ProductResponse {
     id: number;
@@ -404,10 +413,10 @@ ${bodyMeasurements.footSize ? `- 발 사이즈: ${bodyMeasurements.footSize}mm` 
                 {/* 이미지 섹션 */}
                 <div className="relative bg-gray-100 rounded-3xl overflow-hidden aspect-[3/4] lg:aspect-square shadow-sm group">
                     <img 
-                        src={product.image_url || "/placeholder.png"} 
+                        src={getImageUrl(product.image_url)} 
                         alt={product.name} 
                         className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700"
-                        onError={(e) => (e.currentTarget.src = "/placeholder.png")}
+                        onError={(e) => (e.currentTarget.src = "https://placehold.co/400x500/CCCCCC/666666?text=No+Image")}
                     />
                     <button className="absolute top-4 right-4 p-3 bg-white/80 backdrop-blur-md rounded-full text-gray-700 hover:bg-white hover:text-purple-600 transition-all shadow-sm">
                         <Maximize2 className="w-5 h-5" />

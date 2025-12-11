@@ -4,7 +4,10 @@ import {
   Title, Tooltip, Legend, ArcElement,
 } from 'chart.js';
 import { Line, Doughnut } from 'react-chartjs-2';
-import { TrendingUp, Users, Package, DollarSign, ListChecks, Loader2, Mail } from 'lucide-react'; 
+import { 
+  TrendingUp, Users, Package, DollarSign, ListChecks, Loader2, Mail,
+  Upload, ShoppingCart, ArrowRight
+} from 'lucide-react'; 
 import { Link } from 'react-router-dom';
 import { Button } from '@/components/ui/button'; 
 import { useQuery } from '@tanstack/react-query';
@@ -27,11 +30,42 @@ const statConfig = [
     { key: 'growth_rate', title: '성장률', icon: TrendingUp, color: 'text-red-500', format: (v: number) => `+${v}%` },
 ];
 
+// ✅ 관리 메뉴 설정
+const menuConfig = [
+    { 
+        to: '/admin/upload', 
+        icon: Upload, 
+        title: '상품 등록', 
+        desc: 'AI 자동 분석으로 상품 등록',
+        color: 'from-purple-500 to-purple-600'
+    },
+    { 
+        to: '/admin/products', 
+        icon: Package, 
+        title: '상품 관리', 
+        desc: '등록된 상품 조회/수정/삭제',
+        color: 'from-blue-500 to-blue-600'
+    },
+    { 
+        to: '/admin/customers', 
+        icon: Users, 
+        title: '고객 관리', 
+        desc: '회원 정보 조회 및 관리',
+        color: 'from-green-500 to-green-600'
+    },
+    { 
+        to: '/admin/sales', 
+        icon: ShoppingCart, 
+        title: '판매 관리', 
+        desc: '주문 현황 및 매출 통계',
+        color: 'from-orange-500 to-orange-600'
+    },
+];
+
 const useDashboardStats = (timeRange: 'daily' | 'weekly' | 'monthly') => {
     return useQuery<DashboardStatsResponse>({
         queryKey: ['adminDashboard', timeRange],
         queryFn: async () => {
-            // 🚨 FIX: baseURL에 /api/v1이 포함되어 있으므로 경로에서 제거
             const res = await client.get(`/admin/dashboard`, {
                 params: { time_range: timeRange }
             });
@@ -44,8 +78,6 @@ const useDashboardStats = (timeRange: 'daily' | 'weekly' | 'monthly') => {
 
 export default function Dashboard() {
     const [timeRange, setTimeRange] = useState<'daily' | 'weekly' | 'monthly'>('weekly');
-    
-    // 모달 상태 관리
     const [isEmailModalOpen, setIsEmailModalOpen] = useState(false);
 
     const { data: stats, isLoading, isError } = useDashboardStats(timeRange);
@@ -82,11 +114,11 @@ export default function Dashboard() {
 
     return (
         <div className="p-6 space-y-6 bg-gray-50 dark:bg-gray-900 min-h-screen">
+            {/* Header */}
             <div className="flex justify-between items-center mb-6">
                 <h1 className="text-3xl font-bold text-gray-800 dark:text-white">Admin Dashboard</h1>
                 
                 <div className="flex items-center space-x-4">
-                    {/* 단체 메일 발송 버튼 */}
                     <Button 
                         variant="outline" 
                         className="flex items-center bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
@@ -96,7 +128,6 @@ export default function Dashboard() {
                         단체 메일
                     </Button>
 
-                    {/* 상품 업로드 링크 */}
                     <Link to="/admin/upload">
                         <Button variant="default" className="flex items-center">
                             <ListChecks size={20} className="mr-2" /> 상품 관리/업로드
@@ -105,7 +136,28 @@ export default function Dashboard() {
                 </div>
             </div>
 
-            <div className="mb-8 flex space-x-2">
+            {/* ✅ 관리 메뉴 바로가기 */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                {menuConfig.map((menu) => (
+                    <Link 
+                        key={menu.to} 
+                        to={menu.to}
+                        className="group bg-white dark:bg-gray-800 p-4 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700 hover:shadow-lg hover:border-purple-200 dark:hover:border-purple-800 transition-all duration-300"
+                    >
+                        <div className="flex items-center justify-between mb-3">
+                            <div className={`w-10 h-10 rounded-xl bg-gradient-to-br ${menu.color} flex items-center justify-center text-white shadow-md`}>
+                                <menu.icon size={20} />
+                            </div>
+                            <ArrowRight className="w-4 h-4 text-gray-300 group-hover:text-purple-500 group-hover:translate-x-1 transition-all" />
+                        </div>
+                        <h3 className="font-bold text-gray-900 dark:text-white">{menu.title}</h3>
+                        <p className="text-xs text-gray-500 mt-1">{menu.desc}</p>
+                    </Link>
+                ))}
+            </div>
+
+            {/* Time Range Buttons */}
+            <div className="flex space-x-2">
                 <Button 
                     variant={timeRange === 'daily' ? 'default' : 'secondary'} 
                     onClick={() => setTimeRange('daily')}
@@ -123,6 +175,7 @@ export default function Dashboard() {
                 >월간</Button>
             </div>
 
+            {/* Stats Cards */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                 {statConfig.map((stat, index) => {
                     const value = stat.format((stats as any)[stat.key]);
@@ -140,6 +193,7 @@ export default function Dashboard() {
                 })}
             </div>
 
+            {/* Charts */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                 <div className="lg:col-span-2 bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700">
                     <h3 className="font-bold text-lg mb-4 text-gray-800 dark:text-white">
@@ -158,7 +212,7 @@ export default function Dashboard() {
                 </div>
             </div>
 
-            {/* 모달 컴포넌트 */}
+            {/* Email Modal */}
             <EmailBroadcastModal 
                 isOpen={isEmailModalOpen} 
                 onClose={() => setIsEmailModalOpen(false)} 
